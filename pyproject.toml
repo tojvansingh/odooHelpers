@@ -1,0 +1,22 @@
+[project]
+name = "inventorymgr"
+version = "0.1.0"
+description = "Inventory planning, ordering & receiving automation for Catstudio (Odoo + Google Sheets)."
+requires-python = ">=3.12"
+dependencies = [
+    "gspread>=6.2.1",
+    "openpyxl>=3.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q"

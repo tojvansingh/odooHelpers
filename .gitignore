@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# local business data — do not commit
+*.xlsx
+
+# credentials / secrets — never commit
+.env
+secrets/
+*credentials*.json
+*service*account*.json

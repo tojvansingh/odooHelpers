@@ -69,6 +69,32 @@ def _grid(months, results, moq) -> list[list]:
     return grid
 
 
+NEG_FILL = {"red": 0.96, "green": 0.80, "blue": 0.80}  # light red for negative inventory
+
+
+def _apply_negative_shading(ws, n_months: int, n_rows: int) -> None:
+    """Shade negative projected-inventory cells (the Inv block + Proj End) light red."""
+    if n_rows < 1:
+        return
+    end_row = 1 + n_rows
+    ranges = [
+        {"sheetId": ws.id, "startRowIndex": 1, "endRowIndex": end_row,
+         "startColumnIndex": NB, "endColumnIndex": NB + n_months},  # Inv projection block
+        {"sheetId": ws.id, "startRowIndex": 1, "endRowIndex": end_row,
+         "startColumnIndex": 8, "endColumnIndex": 9},               # Proj End (col I)
+    ]
+    rule = {
+        "ranges": ranges,
+        "booleanRule": {
+            "condition": {"type": "NUMBER_LESS", "values": [{"userEnteredValue": "0"}]},
+            "format": {"backgroundColor": NEG_FILL},
+        },
+    }
+    ws.spreadsheet.batch_update(
+        {"requests": [{"addConditionalFormatRule": {"rule": rule, "index": 0}}]}
+    )
+
+
 def write_class_tab(ws, months, results, moq) -> None:
     grid = _grid(months, results, moq)
     ws.resize(rows=max(len(grid), 2), cols=len(grid[0]))
@@ -76,6 +102,7 @@ def write_class_tab(ws, months, results, moq) -> None:
     ws.freeze(rows=1)
     ws.format("1:1", {"textFormat": {"bold": True}})
     ws.hide_columns(0, 1)  # hide product_id (column A)
+    _apply_negative_shading(ws, len(months), len(grid) - 1)
 
 
 def build_review_spreadsheet(gsheets, class_to_plan: dict, title: str | None = None):

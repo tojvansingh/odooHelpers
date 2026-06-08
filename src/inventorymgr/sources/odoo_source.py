@@ -23,24 +23,32 @@ def _m2o_name(value) -> str:
     return value[1] if value else ""
 
 
+def _to_product(r: dict) -> Product:
+    return Product(
+        name=r.get("name") or "",
+        display_name=r.get("display_name") or "",
+        class_name=_m2o_name(r.get("class_id")),
+        collection=_m2o_name(r.get("collection_id")),
+        on_hand=r.get("qty_available") or 0,
+        incoming=r.get("incoming_qty") or 0,
+        outgoing=r.get("outgoing_qty") or 0,
+        average_cost=r.get("standard_price") or 0,
+    )
+
+
 def read_products_by_class(client: OdooClient, class_name: str, active_only: bool = True) -> dict[int, Product]:
     domain = [["class_id.name", "=", class_name]]
     if active_only:
         domain.append(["active", "=", True])
     recs = client.search_read("product.product", domain, STOCK_FIELDS)
-    out: dict[int, Product] = {}
-    for r in recs:
-        out[r["id"]] = Product(
-            name=r.get("name") or "",
-            display_name=r.get("display_name") or "",
-            class_name=_m2o_name(r.get("class_id")),
-            collection=_m2o_name(r.get("collection_id")),
-            on_hand=r.get("qty_available") or 0,
-            incoming=r.get("incoming_qty") or 0,
-            outgoing=r.get("outgoing_qty") or 0,
-            average_cost=r.get("standard_price") or 0,
-        )
-    return out
+    return {r["id"]: _to_product(r) for r in recs}
+
+
+def read_products_by_ids(client: OdooClient, ids) -> dict[int, Product]:
+    if not ids:
+        return {}
+    recs = client.search_read("product.product", [["id", "in", list(ids)]], STOCK_FIELDS)
+    return {r["id"]: _to_product(r) for r in recs}
 
 
 def _month_key_from_group(row: dict) -> str:

@@ -23,9 +23,10 @@ def main() -> None:
     ap.add_argument("--class", dest="class_name", default="Dish Towels")
     ap.add_argument("--limit", type=int, default=0, help="cap products (debug)")
     ap.add_argument("--all", action="store_true", help="print every row, not just orders/flags")
+    ap.add_argument("--prod", action="store_true", help="use the production Odoo profile")
     args = ap.parse_args()
 
-    client = OdooClient()
+    client = OdooClient(profile="prod" if args.prod else "local")
     params = load_class_params().get(args.class_name)
     if params is None:
         raise SystemExit(f"No params for class {args.class_name!r} in data/class_params.csv")

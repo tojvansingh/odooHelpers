@@ -8,8 +8,8 @@ from ..settings import OdooSettings, odoo_settings
 
 
 class OdooClient:
-    def __init__(self, settings: OdooSettings | None = None):
-        self.s = settings or odoo_settings()
+    def __init__(self, settings: OdooSettings | None = None, profile: str = "local"):
+        self.s = settings or odoo_settings(profile)
         self._common = xmlrpc.client.ServerProxy(f"{self.s.url}/xmlrpc/2/common")
         self._models = xmlrpc.client.ServerProxy(f"{self.s.url}/xmlrpc/2/object")
         self._uid: int | None = None

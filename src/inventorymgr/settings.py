@@ -27,17 +27,25 @@ class OdooSettings:
     api_key: str
 
 
-def odoo_settings() -> OdooSettings:
+def odoo_settings(profile: str = "local") -> OdooSettings:
+    """Load Odoo connection settings for a profile.
+
+    'local' reads ODOO_URL/ODOO_DB/ODOO_USER/ODOO_API_KEY.
+    'prod'  reads ODOO_PROD_URL/ODOO_PROD_DB/ODOO_PROD_USER/ODOO_PROD_API_KEY.
+    """
     load_dotenv()
+    prefix = "" if profile == "local" else "PROD_"
     try:
         return OdooSettings(
-            url=os.environ["ODOO_URL"],
-            db=os.environ["ODOO_DB"],
-            user=os.environ["ODOO_USER"],
-            api_key=os.environ["ODOO_API_KEY"],
+            url=os.environ[f"ODOO_{prefix}URL"],
+            db=os.environ[f"ODOO_{prefix}DB"],
+            user=os.environ[f"ODOO_{prefix}USER"],
+            api_key=os.environ[f"ODOO_{prefix}API_KEY"],
         )
     except KeyError as exc:
-        raise RuntimeError(f"Missing Odoo setting {exc} — set it in inventorymgr/.env") from exc
+        raise RuntimeError(
+            f"Missing Odoo setting {exc} for profile {profile!r} — set it in inventorymgr/.env"
+        ) from exc
 
 
 @dataclass(frozen=True)

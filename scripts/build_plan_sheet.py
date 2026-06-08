@@ -23,10 +23,11 @@ from inventorymgr.sources.odoo_source import (
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--class", dest="classes", action="append", help="Class name (repeatable)")
+    ap.add_argument("--prod", action="store_true", help="use the production Odoo profile")
     args = ap.parse_args()
     classes = args.classes or ["Dish Towels"]
 
-    client = OdooClient()
+    client = OdooClient(profile="prod" if args.prod else "local")
     params_all = load_class_params()
     today = datetime.date.today()
 

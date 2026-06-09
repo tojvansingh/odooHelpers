@@ -67,8 +67,10 @@ def read_monthly_sales(
     if not product_ids:
         return {}
     domain = [["product_id", "in", list(product_ids)], ["state", "in", list(states)]]
+    # Bucket months in the user's timezone so monthly totals match Odoo's UI report.
     rows = client.read_group(
-        "sale.report", domain, ["product_uom_qty:sum"], ["product_id", "date:month"], lazy=False
+        "sale.report", domain, ["product_uom_qty:sum"], ["product_id", "date:month"],
+        lazy=False, context={"tz": client.user_tz},
     )
     out: dict[int, dict[str, float]] = {}
     for r in rows:

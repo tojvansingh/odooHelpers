@@ -14,6 +14,7 @@ class OdooClient:
         self._common = xmlrpc.client.ServerProxy(f"{base}/xmlrpc/2/common")
         self._models = xmlrpc.client.ServerProxy(f"{base}/xmlrpc/2/object")
         self._uid: int | None = None
+        self._tz: str | None = None
 
     @property
     def uid(self) -> int:
@@ -23,6 +24,14 @@ class OdooClient:
                 raise RuntimeError("Odoo authentication failed — check inventorymgr/.env")
             self._uid = uid
         return self._uid
+
+    @property
+    def user_tz(self) -> str:
+        """Connected user's timezone, so date grouping matches what they see in the UI."""
+        if self._tz is None:
+            rec = self.execute_kw("res.users", "read", [[self.uid], ["tz"]])
+            self._tz = (rec[0].get("tz") if rec else None) or "UTC"
+        return self._tz
 
     def version(self) -> dict:
         return self._common.version()

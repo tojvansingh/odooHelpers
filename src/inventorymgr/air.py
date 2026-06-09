@@ -107,3 +107,70 @@ def fetch_air_data(client: OdooClient, input_po_names):
 
 def onsched_through(onsched_list, cutoff_iso: str) -> float:
     return sum(q for (d, q) in (onsched_list or []) if d is None or d <= cutoff_iso)
+
+
+def fetch_booked_outgoing(client: OdooClient, product_ids) -> list[dict]:
+    """Open outgoing (delivery) demand: [{pid, partner_id, customer, date|None, qty}].
+
+    These are confirmed sales not yet shipped, dated by their delivery's scheduled
+    ship date so they can be phased into the period they actually leave.
+    """
+    if not product_ids:
+        return []
+    moves = client.search_read(
+        "stock.move",
+        [["product_id", "in", list(product_ids)],
+         ["picking_id.picking_type_code", "=", "outgoing"],
+         ["state", "not in", ["done", "cancel"]]],
+        ["product_id", "product_uom_qty", "date", "picking_id"],
+    )
+    pick_ids = list({m["picking_id"][0] for m in moves if m.get("picking_id")})
+    partner_of_pick = {}
+    if pick_ids:
+        for p in client.search_read("stock.picking", [["id", "in", pick_ids]], ["partner_id"]):
+            partner_of_pick[p["id"]] = p.get("partner_id") or None
+    out = []
+    for m in moves:
+        qty = m["product_uom_qty"] or 0
+        if qty <= 0:
+            continue
+        pk = m["picking_id"][0] if m.get("picking_id") else None
+        partner = partner_of_pick.get(pk)
+        out.append({
+            "pid": m["product_id"][0],
+            "partner_id": partner[0] if partner else None,
+            "customer": partner[1] if partner else "",
+            "date": (m["date"] or "")[:10] or None,
+            "qty": qty,
+        })
+    return out
+
+
+def fetch_lastyear_buyer_sets(client: OdooClient, product_ids, date_from: str, date_to: str) -> dict[int, set]:
+    """{pid: {partner_id, ...}} — customers who bought each product within [date_from, date_to]."""
+    if not product_ids:
+        return {}
+    rows = client.execute_kw(
+        "sale.report", "read_group",
+        [[["product_id", "in", list(product_ids)], ["state", "in", ["sale", "done"]],
+          ["date", ">=", date_from], ["date", "<=", date_to]],
+         ["product_uom_qty:sum"], ["product_id", "partner_id"]],
+        {"lazy": False, "context": {"tz": client.user_tz}},
+    )
+    out: dict[int, set] = {}
+    for r in rows:
+        if r.get("partner_id"):
+            out.setdefault(r["product_id"][0], set()).add(r["partner_id"][0])
+    return out
+
+
+def commercial_partner_map(client: OdooClient, partner_ids) -> dict[int, int]:
+    """{partner_id: commercial_partner_id} — collapses contacts/ship-to addresses to the company,
+    so a customer matches across order partner vs. delivery partner."""
+    ids = [p for p in {pp for pp in partner_ids if pp}]
+    out: dict[int, int] = {}
+    if ids:
+        for r in client.search_read("res.partner", [["id", "in", ids]], ["commercial_partner_id"]):
+            cp = r.get("commercial_partner_id")
+            out[r["id"]] = cp[0] if cp else r["id"]
+    return out

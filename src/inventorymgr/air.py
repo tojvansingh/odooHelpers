@@ -1,8 +1,9 @@
-"""AIR-vs-SEA expedite analysis: given a set of PO numbers to potentially air,
-figure out how much of each line to air to avoid stockouts by target dates.
+"""AIR-vs-SEA expedite analysis: given PO numbers to potentially air, figure out
+how much of each line to air to avoid stockouts by target dates.
 
-Arrival timing of *other* (on-schedule) open POs is read from the Delivery
-(stock.picking) scheduled_date, which is treated as accurate.
+"Incoming" supply = receipts in **Ready** state only (stock.move state='assigned',
+incoming) — a PO can show unreceived qty while its receipt is cancelled/done, so
+PO-line remaining overcounts. Each move is dated by its own scheduled date.
 """
 
 from __future__ import annotations
@@ -33,79 +34,76 @@ def month_range(y0: int, m0: int, y1: int, m1: int) -> list[tuple[int, int]]:
     return out
 
 
-def fetch_po_arrivals(client: OdooClient, po_names) -> dict[str, str]:
-    """{po_name: earliest open incoming Delivery scheduled_date 'YYYY-MM-DD'}."""
-    pos = client.search_read("purchase.order", [["name", "in", list(po_names)]], ["name", "picking_ids"])
-    pick_to_po: dict[int, str] = {}
-    for p in pos:
-        for pk in p.get("picking_ids") or []:
-            pick_to_po[pk] = p["name"]
-    arrivals: dict[str, str] = {}
-    if pick_to_po:
-        picks = client.search_read(
-            "stock.picking", [["id", "in", list(pick_to_po)]],
-            ["id", "scheduled_date", "state", "picking_type_code"],
-        )
-        for pk in picks:
-            if pk.get("state") in ("done", "cancel"):
-                continue
-            if (pk.get("picking_type_code") or "incoming") != "incoming":
-                continue
-            sd = pk.get("scheduled_date")
-            if not sd:
-                continue
-            po, day = pick_to_po[pk["id"]], sd[:10]
-            if po not in arrivals or day < arrivals[po]:
-                arrivals[po] = day
-    return arrivals
+def _po_name_by_line(client: OdooClient, line_ids) -> dict[int, str]:
+    ids = list({i for i in line_ids if i})
+    if not ids:
+        return {}
+    rows = client.search_read("purchase.order.line", [["id", "in", ids]], ["order_id"])
+    return {r["id"]: r["order_id"][1] for r in rows if r.get("order_id")}
+
+
+def fetch_ready_incoming(client: OdooClient, product_ids) -> list[dict]:
+    """Ready (assigned) incoming moves for the products: [{pid, po, date|None, qty}]."""
+    if not product_ids:
+        return []
+    moves = client.search_read(
+        "stock.move",
+        [["product_id", "in", list(product_ids)],
+         ["state", "=", "assigned"],
+         ["picking_id.picking_type_code", "=", "incoming"]],
+        ["product_id", "product_uom_qty", "date", "purchase_line_id"],
+    )
+    po_by_line = _po_name_by_line(client, [m["purchase_line_id"][0] for m in moves if m.get("purchase_line_id")])
+    rows = []
+    for m in moves:
+        plid = m["purchase_line_id"][0] if m.get("purchase_line_id") else None
+        rows.append({
+            "pid": m["product_id"][0],
+            "po": po_by_line.get(plid),
+            "date": (m["date"] or "")[:10] or None,
+            "qty": m["product_uom_qty"] or 0,
+        })
+    return rows
 
 
 def fetch_air_data(client: OdooClient, input_po_names):
-    """Returns (air_qty, products, onsched, input_arrivals).
+    """Returns (air_qty, products, onsched, deliveries).
 
-    air_qty: {pid: remaining qty on the input POs (what we could air)}
+    air_qty: {pid: ready incoming qty on the input POs (what we can air)}
     products: {pid: Product}
-    onsched: {pid: [(arrival 'YYYY-MM-DD'|None, qty)]} for all OTHER open POs
-    input_arrivals: {input_po_name: Delivery scheduled date}
+    onsched: {pid: [(date|None, qty)]} ready incoming on OTHER POs
+    deliveries: [{pid, display_name, po, type('air'|'on-schedule'), date, qty}] (all ready incoming)
     """
     input_po_names = set(input_po_names)
-    in_lines = client.search_read(
-        "purchase.order.line", [["order_id.name", "in", list(input_po_names)]],
-        ["order_id", "product_id", "product_qty", "qty_received"],
+    air_moves = client.search_read(
+        "stock.move",
+        [["purchase_line_id.order_id.name", "in", list(input_po_names)],
+         ["state", "=", "assigned"],
+         ["picking_id.picking_type_code", "=", "incoming"]],
+        ["product_id"],
     )
-    air_qty: dict[int, float] = {}
-    for line in in_lines:
-        rem = (line["product_qty"] or 0) - (line["qty_received"] or 0)
-        if rem > 0:
-            air_qty[line["product_id"][0]] = air_qty.get(line["product_id"][0], 0) + rem
-
-    pids = list(air_qty)
+    pids = sorted({m["product_id"][0] for m in air_moves})
     products = read_products_by_ids(client, pids)
 
-    open_lines = client.search_read(
-        "purchase.order.line",
-        [["product_id", "in", pids], ["state", "in", ["purchase", "done"]]],
-        ["order_id", "product_id", "product_qty", "qty_received", "date_planned"],
-    )
-    all_po_names = {x["order_id"][1] for x in open_lines} | input_po_names
-    arrivals = fetch_po_arrivals(client, all_po_names)
-
+    deliveries: list[dict] = []
+    air_qty: dict[int, float] = {}
     onsched: dict[int, list[tuple[str | None, float]]] = {}
-    for line in open_lines:
-        po = line["order_id"][1]
-        if po in input_po_names:
-            continue
-        rem = (line["product_qty"] or 0) - (line["qty_received"] or 0)
-        if rem <= 0:
-            continue
-        dp = line.get("date_planned")
-        arrival = arrivals.get(po) or (dp[:10] if dp else None)
-        onsched.setdefault(line["product_id"][0], []).append((arrival, rem))
-
-    input_arrivals = {po: arrivals.get(po) for po in input_po_names}
-    return air_qty, products, onsched, input_arrivals
+    for row in fetch_ready_incoming(client, pids):
+        is_air = row["po"] in input_po_names
+        deliveries.append({
+            "pid": row["pid"],
+            "display_name": products[row["pid"]].display_name if row["pid"] in products else "",
+            "po": row["po"],
+            "type": "air" if is_air else "on-schedule",
+            "date": row["date"],
+            "qty": row["qty"],
+        })
+        if is_air:
+            air_qty[row["pid"]] = air_qty.get(row["pid"], 0) + row["qty"]
+        else:
+            onsched.setdefault(row["pid"], []).append((row["date"], row["qty"]))
+    return air_qty, products, onsched, deliveries
 
 
 def onsched_through(onsched_list, cutoff_iso: str) -> float:
-    """Sum of on-schedule incoming arriving on/before cutoff (undated counts as arriving)."""
-    return sum(q for (arrival, q) in (onsched_list or []) if arrival is None or arrival <= cutoff_iso)
+    return sum(q for (d, q) in (onsched_list or []) if d is None or d <= cutoff_iso)

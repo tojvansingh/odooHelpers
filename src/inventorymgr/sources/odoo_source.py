@@ -45,9 +45,13 @@ def read_products_by_class(client: OdooClient, class_name: str, active_only: boo
 
 
 def read_products_by_ids(client: OdooClient, ids) -> dict[int, Product]:
+    # active_test=False so archived products (still on POs/receipts) resolve too.
     if not ids:
         return {}
-    recs = client.search_read("product.product", [["id", "in", list(ids)]], STOCK_FIELDS)
+    recs = client.search_read(
+        "product.product", [["id", "in", list(ids)]], STOCK_FIELDS,
+        context={"active_test": False},
+    )
     return {r["id"]: _to_product(r) for r in recs}
 
 

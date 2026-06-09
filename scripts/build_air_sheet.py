@@ -22,6 +22,7 @@ import argparse
 import datetime
 import math
 
+import gspread
 from openpyxl.utils import get_column_letter as col
 
 from inventorymgr.air import add_months, fetch_air_data, last_day_of_month, month_range, onsched_through
@@ -39,6 +40,25 @@ PER_TARGET = 5  # Onsched, Demand->T, Need, AIR, Short
 
 def _ceil_round(x: float) -> float:
     return 0 if x <= 0 else math.ceil(x / AIR_ROUND) * AIR_ROUND
+
+
+def _reset_tab(sh, name: str, rows: int, cols: int):
+    """Get-or-create a worksheet by name, cleared of values AND conditional formats."""
+    try:
+        ws = sh.worksheet(name)
+    except gspread.WorksheetNotFound:
+        return sh.add_worksheet(title=name, rows=rows, cols=cols)
+    ws.clear()
+    for meta in sh.fetch_sheet_metadata().get("sheets", []):
+        if meta["properties"]["sheetId"] == ws.id:
+            n = len(meta.get("conditionalFormats", []))
+            if n:
+                sh.batch_update({"requests": [
+                    {"deleteConditionalFormatRule": {"sheetId": ws.id, "index": i}}
+                    for i in range(n - 1, -1, -1)
+                ]})
+    ws.resize(rows=rows, cols=cols)
+    return ws
 
 
 def main() -> None:
@@ -118,19 +138,17 @@ def main() -> None:
 
     # ---------- write ----------
     g = GSheets()
-    title = f"AIR Plan {today:%Y-%m-%d} ({'+'.join(args.pos)})"
-    sh = g.create(title)
+    title = f"AIR Plan — {'+'.join(sorted(args.pos))}"  # stable name: reused/overwritten each run
+    sh = g.open_or_create(title)
 
-    # Write Deliveries FIRST so the AIR tab's SUMIFS references resolve at entry time.
-    dv = sh.add_worksheet(title="Deliveries", rows=max(len(deliv_grid), 2), cols=len(DELIV_HEADERS))
+    # Deliveries first so the AIR tab's SUMIFS references resolve at entry time.
+    dv = _reset_tab(sh, "Deliveries", max(len(deliv_grid), 2), len(DELIV_HEADERS))
     dv.update(values=deliv_grid, range_name="A1", value_input_option="USER_ENTERED")
     dv.freeze(rows=1)
     dv.format("1:1", {"textFormat": {"bold": True}})
     dv.hide_columns(0, 1)
 
-    ws = sh.sheet1
-    ws.update_title("AIR vs SEA")
-    ws.resize(rows=max(len(grid), 2), cols=len(grid[0]))
+    ws = _reset_tab(sh, "AIR vs SEA", max(len(grid), 2), len(grid[0]))
     ws.update(values=grid, range_name="A1", value_input_option="USER_ENTERED")
     ws.freeze(rows=1)
     ws.format("1:1", {"textFormat": {"bold": True}})
@@ -148,10 +166,15 @@ def main() -> None:
                                  "format": {"backgroundColor": NEG_FILL}}},
         "index": 0}}]})
 
+    # drop any leftover tabs (e.g. the default Sheet1 created with a new spreadsheet)
+    for w in sh.worksheets():
+        if w.title not in ("Deliveries", "AIR vs SEA"):
+            sh.del_worksheet(w)
+
     print()
     for k, t in enumerate(targets):
         print(f"target {t}: total AIR = {air_totals[k]:.0f}, items short even after airing = {short_counts[k]}")
-    print("\nCreated:", title)
+    print("\nSheet:", title)
     print("URL:", sh.url)
 
 

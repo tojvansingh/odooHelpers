@@ -82,8 +82,8 @@ def fetch_air_data(client: OdooClient, input_po_names):
          ["picking_id.picking_type_code", "=", "incoming"]],
         ["product_id"],
     )
-    pids = sorted({m["product_id"][0] for m in air_moves})
-    products = read_products_by_ids(client, pids)
+    products = read_products_by_ids(client, sorted({m["product_id"][0] for m in air_moves}))
+    pids = list(products)  # active only — archived (discontinued) products are excluded
 
     deliveries: list[dict] = []
     air_qty: dict[int, float] = {}
@@ -92,7 +92,7 @@ def fetch_air_data(client: OdooClient, input_po_names):
         is_air = row["po"] in input_po_names
         deliveries.append({
             "pid": row["pid"],
-            "display_name": products[row["pid"]].display_name if row["pid"] in products else "",
+            "display_name": products[row["pid"]].display_name,
             "po": row["po"],
             "type": "air" if is_air else "on-schedule",
             "date": row["date"],

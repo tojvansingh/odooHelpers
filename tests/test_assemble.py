@@ -1,10 +1,26 @@
 from inventorymgr.assemble import (
+    booked_by_month,
     build_incoming_index,
     horizon_length,
     horizon_months,
     month_key,
 )
 from inventorymgr.model import ClassParams
+
+
+def test_booked_by_month_returning_vs_new():
+    months = horizon_months(2026, 6, 4)  # 2026-06 .. 2026-09
+    buyers = {"2025-06": {100}, "2025-07": {100}}  # last-year buyers per month (commercial ids)
+    bookings = [
+        ("2026-06-10", 50, 100),  # returning (bought 2025-06)
+        ("2026-06-15", 20, 200),  # new
+        ("2026-07-01", 30, 100),  # returning (2025-07)
+        ("2026-12-01", 99, 100),  # beyond horizon -> ignored
+        (None, 10, 100),          # undated -> month 0; returning
+    ]
+    ret, new = booked_by_month(bookings, buyers, months)
+    assert ret == [60, 30, 0, 0]
+    assert new == [20, 0, 0, 0]
 
 
 def test_month_key():

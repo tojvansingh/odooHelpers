@@ -27,11 +27,20 @@ class Product:
 
 @dataclass
 class PlanInput:
-    """Everything the engine needs to plan one product."""
+    """Everything the engine needs to plan one product.
+
+    Demand per month = max(forecast, booked_returning) + booked_new (customer-aware,
+    avoids double-counting Outgoing). booked_* default to zero (naive forecast-only).
+    starting_inventory defaults to On Hand - Outgoing when None (the legacy model);
+    the live plan passes On Hand and lets booked demand carry the committed orders.
+    """
 
     product: Product
-    forecasts: list[float]  # demand per horizon month (last-year same-calendar-month units)
+    forecasts: list[float]  # last-year same-calendar-month units
     incoming_by_index: dict[int, float] = field(default_factory=dict)  # horizon step -> qty arriving
+    booked_returning: list[float] = field(default_factory=list)  # open orders shipping each month, returning customers
+    booked_new: list[float] = field(default_factory=list)  # ... new customers (incremental demand)
+    starting_inventory: float | None = None
 
 
 @dataclass
@@ -43,5 +52,8 @@ class PlanResult:
     baseline_qty: float  # mechanical order qty from the formula
     recommended_qty: float  # after auto-rules (Custom -> 0)
     flags: list[str]
-    forecasts: list[float] = field(default_factory=list)  # demand per horizon month
+    forecasts: list[float] = field(default_factory=list)  # last-year demand per horizon month
     incoming: list[float] = field(default_factory=list)  # PO arrivals per horizon month
+    demand: list[float] = field(default_factory=list)  # consumed demand per month (max(forecast,ret)+new)
+    booked_returning: list[float] = field(default_factory=list)
+    booked_new: list[float] = field(default_factory=list)

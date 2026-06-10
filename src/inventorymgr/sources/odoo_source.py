@@ -99,3 +99,17 @@ def read_open_po_remaining(
         dp = r.get("date_planned")
         out.setdefault(pid, []).append((dp[:7] if dp else None, remaining))
     return out
+
+
+def read_product_ids_for_vendor(client: OdooClient, vendor_name: str) -> set:
+    """product.product ids whose template (or variant) has a supplier line for the vendor."""
+    sinfo = client.search_read(
+        "product.supplierinfo", [["partner_id.name", "ilike", vendor_name]],
+        ["product_tmpl_id", "product_id"],
+    )
+    tmpl_ids = {s["product_tmpl_id"][0] for s in sinfo if s.get("product_tmpl_id")}
+    pids = {s["product_id"][0] for s in sinfo if s.get("product_id")}
+    if tmpl_ids:
+        prods = client.search_read("product.product", [["product_tmpl_id", "in", list(tmpl_ids)]], ["id"])
+        pids |= {p["id"] for p in prods}
+    return pids

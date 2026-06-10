@@ -50,6 +50,44 @@ def build_incoming_index(
     return sched
 
 
+def last_year_key(year: int, month: int) -> str:
+    return month_key(year - 1, month)
+
+
+def classify_booking_month(ship_date: str | None, months: list[tuple[int, int]]) -> int | None:
+    """Horizon index a booking lands in by ship date (overdue/before -> 0, beyond end -> None)."""
+    first, last = month_key(*months[0]), month_key(*months[-1])
+    if not ship_date or ship_date[:7] < first:
+        return 0
+    if ship_date[:7] > last:
+        return None
+    return {month_key(y, m): i for i, (y, m) in enumerate(months)}[ship_date[:7]]
+
+
+def booking_type(ship_date, commercial_pid, buyers_by_month, months) -> str | None:
+    """'returning' if the customer bought this product in the same month last year, else 'new'.
+    None if it ships beyond the horizon."""
+    idx = classify_booking_month(ship_date, months)
+    if idx is None:
+        return None
+    y, m = months[idx]
+    returning = commercial_pid is not None and commercial_pid in buyers_by_month.get(last_year_key(y, m), set())
+    return "returning" if returning else "new"
+
+
+def booked_by_month(bookings, buyers_by_month, months) -> tuple[list[float], list[float]]:
+    """(booked_returning, booked_new) per horizon month, from open outgoing bookings."""
+    n = len(months)
+    ret, new = [0.0] * n, [0.0] * n
+    for ship_date, qty, commercial_pid in bookings or []:
+        idx = classify_booking_month(ship_date, months)
+        if idx is None:
+            continue
+        t = booking_type(ship_date, commercial_pid, buyers_by_month, months)
+        (ret if t == "returning" else new)[idx] += qty or 0
+    return ret, new
+
+
 def assemble_plan(
     products: dict[int, Product],
     sales: dict[int, dict[str, float]],
@@ -57,8 +95,13 @@ def assemble_plan(
     params: ClassParams,
     start_year: int,
     start_month: int,
+    bookings: dict[int, list] | None = None,
+    buyers_by_month: dict[int, dict[str, set]] | None = None,
+    horizon_override: int | None = None,
 ) -> tuple[list[tuple[int, int]], list[tuple[int, PlanResult]]]:
-    n = horizon_length(params)
+    bookings = bookings or {}
+    buyers_by_month = buyers_by_month or {}
+    n = horizon_override or horizon_length(params)
     months = horizon_months(start_year, start_month, n)
     results: list[tuple[int, PlanResult]] = []
     for pid, product in products.items():
@@ -66,5 +109,11 @@ def assemble_plan(
         # Forecast each horizon month from last year's same calendar month.
         forecasts = [product_sales.get(month_key(y - 1, m), 0) for (y, m) in months]
         incoming = build_incoming_index(remaining.get(pid), months)
-        results.append((pid, make_plan(PlanInput(product, forecasts, incoming), params.moq_step)))
+        bret, bnew = booked_by_month(bookings.get(pid), buyers_by_month.get(pid, {}), months)
+        # Customer-aware: start from On Hand; booked demand carries the committed orders.
+        pi = PlanInput(
+            product, forecasts, incoming,
+            booked_returning=bret, booked_new=bnew, starting_inventory=product.on_hand,
+        )
+        results.append((pid, make_plan(pi, params.moq_step)))
     return months, results

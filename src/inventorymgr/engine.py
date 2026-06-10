@@ -51,15 +51,23 @@ def compute_flags(p: Product, forecasts: list[float]) -> list[str]:
     return flags
 
 
+def _at(lst: list[float], i: int) -> float:
+    return lst[i] if i < len(lst) else 0
+
+
 def make_plan(pi: PlanInput, moq_step: int | None) -> PlanResult:
-    start = starting_available(pi.product)
-    series = project(start, pi.forecasts, pi.incoming_by_index)
+    n = len(pi.forecasts)
+    # Customer-aware demand: take the GREATER of forecast and returning-customer bookings
+    # (they describe the same demand), then add genuinely-new-customer bookings on top.
+    demand = [max(pi.forecasts[i] or 0, _at(pi.booked_returning, i)) + _at(pi.booked_new, i) for i in range(n)]
+    start = pi.starting_inventory if pi.starting_inventory is not None else starting_available(pi.product)
+    series = project(start, demand, pi.incoming_by_index)
     ending = series[-1] if series else start
     baseline = ceil_to_step(-ending, moq_step)
-    flags = compute_flags(pi.product, pi.forecasts)
+    flags = compute_flags(pi.product, pi.forecasts)  # no_history is about sales history, not demand
     # Custom items are flagged "do not auto-reorder" — the human sets these manually.
     recommended = 0 if "custom" in flags else baseline
-    incoming = [pi.incoming_by_index.get(i, 0) for i in range(len(pi.forecasts))]
+    incoming = [pi.incoming_by_index.get(i, 0) for i in range(n)]
     return PlanResult(
         product=pi.product,
         starting_available=start,
@@ -70,4 +78,7 @@ def make_plan(pi: PlanInput, moq_step: int | None) -> PlanResult:
         flags=flags,
         forecasts=list(pi.forecasts),
         incoming=incoming,
+        demand=demand,
+        booked_returning=[_at(pi.booked_returning, i) for i in range(n)],
+        booked_new=[_at(pi.booked_new, i) for i in range(n)],
     )

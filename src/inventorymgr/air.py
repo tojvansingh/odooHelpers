@@ -164,6 +164,35 @@ def fetch_lastyear_buyer_sets(client: OdooClient, product_ids, date_from: str, d
     return out
 
 
+def fetch_lastyear_buyers_by_month(client: OdooClient, product_ids, date_from: str, date_to: str) -> dict:
+    """{pid: {'YYYY-MM': set(commercial_partner_id)}} — buyers per product per month in the window."""
+    if not product_ids:
+        return {}
+    rows = client.execute_kw(
+        "sale.report", "read_group",
+        [[["product_id", "in", list(product_ids)], ["state", "in", ["sale", "done"]],
+          ["date", ">=", date_from], ["date", "<=", date_to]],
+         ["product_uom_qty:sum"], ["product_id", "partner_id", "date:month"]],
+        {"lazy": False, "context": {"tz": client.user_tz}},
+    )
+    raw: dict[tuple[int, str], set] = {}
+    partners: set = set()
+    for r in rows:
+        if not r.get("partner_id"):
+            continue
+        rng = r.get("__range", {}).get("date:month")
+        mk = rng["from"][:7] if rng else None
+        if not mk:
+            continue
+        raw.setdefault((r["product_id"][0], mk), set()).add(r["partner_id"][0])
+        partners.add(r["partner_id"][0])
+    cmap = commercial_partner_map(client, partners)
+    out: dict[int, dict[str, set]] = {}
+    for (pid, mk), pset in raw.items():
+        out.setdefault(pid, {})[mk] = {cmap.get(p, p) for p in pset}
+    return out
+
+
 def commercial_partner_map(client: OdooClient, partner_ids) -> dict[int, int]:
     """{partner_id: commercial_partner_id} — collapses contacts/ship-to addresses to the company,
     so a customer matches across order partner vs. delivery partner."""

@@ -1,35 +1,60 @@
 """Create DRAFT purchase orders in LOCAL Odoo from a plan sheet's "Order Qty (final)".
 
-LOCAL ONLY — hard-refuses to run against anything but localhost. Products are matched
-from the sheet by SKU (the [code] in Display Name); each is grouped to its primary
-vendor (lowest-sequence product.supplierinfo) and one draft PO is created per vendor.
+LOCAL ONLY — hard-refuses any non-localhost Odoo.
+
+Vendor resolution: every line goes to --vendor, EXCEPT SKUs listed in
+data/vendor_exceptions.csv (sku,vendor) which override. (If --vendor is omitted,
+falls back to each product's primary product.supplierinfo vendor.)
 
 Run:
   cd odooHelpers && PYTHONPATH=src uv run python scripts/create_pos.py \
-      --sheet <KEY> --tab "Dish Towels" [--date-planned 2026-11-15] [--dry-run]
+      --sheet <KEY> --tab "Dish Towels" --vendor "Orchid Overseas" --date-planned 2026-11-15 [--dry-run]
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime
+import pathlib
 import re
 from collections import defaultdict
 
 from inventorymgr.sources.gsheets import GSheets
 from inventorymgr.sources.odoo_client import OdooClient
 
+EXCEPTIONS_CSV = pathlib.Path(__file__).resolve().parents[1] / "data" / "vendor_exceptions.csv"
+
+
+def load_exceptions() -> dict[str, str]:
+    out: dict[str, str] = {}
+    if EXCEPTIONS_CSV.exists():
+        for row in csv.DictReader(EXCEPTIONS_CSV.open()):
+            sku, vendor = (row.get("sku") or "").strip(), (row.get("vendor") or "").strip()
+            if sku and vendor:
+                out[sku] = vendor
+    return out
+
+
+def resolve_vendor(c: OdooClient, name: str, cache: dict) -> tuple | None:
+    if name not in cache:
+        hits = c.search_read("res.partner", [["name", "ilike", name]], ["name", "supplier_rank"])
+        hits.sort(key=lambda p: -(p.get("supplier_rank") or 0))
+        cache[name] = (hits[0]["id"], hits[0]["name"]) if hits else None
+    return cache[name]
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sheet", required=True, help="Google Sheet key")
-    ap.add_argument("--tab", required=True, help="worksheet/tab name")
+    ap.add_argument("--sheet", required=True)
+    ap.add_argument("--tab", required=True)
+    ap.add_argument("--vendor", help="default vendor for all lines (else supplierinfo primary)")
     ap.add_argument("--qty-col", default="Order Qty (final)")
-    ap.add_argument("--date-planned", default=None, help="expected arrival YYYY-MM-DD")
-    ap.add_argument("--dry-run", action="store_true", help="show what would be created, write nothing")
+    ap.add_argument("--date-planned", default=None)
+    ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    c = OdooClient(profile="local")  # writes go to LOCAL only
+    c = OdooClient(profile="local")
     if not any(h in c.s.url for h in ("localhost", "127.0.0.1")):
         raise SystemExit(f"Refusing to run: not local Odoo ({c.s.url})")
 
@@ -59,16 +84,19 @@ def main() -> None:
     missing = [s for s in wanted if s not in by_sku]
     tmpl_ids = list({p["product_tmpl_id"][0] for p in prods if p.get("product_tmpl_id")})
 
-    sinfo = c.search_read(
-        "product.supplierinfo", [["product_tmpl_id", "in", tmpl_ids]],
-        ["product_tmpl_id", "partner_id", "price", "sequence"],
-    )
-    primary: dict[int, tuple] = {}  # tmpl_id -> (partner_id, name, price)
+    sinfo = c.search_read("product.supplierinfo", [["product_tmpl_id", "in", tmpl_ids]],
+                          ["product_tmpl_id", "partner_id", "price", "sequence"])
+    primary: dict[int, tuple] = {}
+    price_by: dict[tuple, float] = {}
     for s in sorted(sinfo, key=lambda x: (x.get("sequence") or 0)):
+        if not s.get("partner_id"):
+            continue
         t = s["product_tmpl_id"][0]
-        if t not in primary and s.get("partner_id"):
-            primary[t] = (s["partner_id"][0], s["partner_id"][1], s.get("price") or 0)
+        primary.setdefault(t, (s["partner_id"][0], s["partner_id"][1], s.get("price") or 0))
+        price_by.setdefault((t, s["partner_id"][0]), s.get("price") or 0)
 
+    exceptions = load_exceptions()
+    vcache: dict = {}
     groups: dict[tuple, list] = defaultdict(list)
     novendor = []
     for sku, qty in wanted.items():
@@ -76,18 +104,25 @@ def main() -> None:
         if not p:
             continue
         t = p["product_tmpl_id"][0] if p.get("product_tmpl_id") else None
-        info = primary.get(t)
-        if not info:
+        vname = exceptions.get(sku) or args.vendor
+        if vname:
+            v = resolve_vendor(c, vname, vcache)
+            if not v:
+                novendor.append(f"{sku}(vendor '{vname}' not found)")
+                continue
+            partner_id, pname = v
+            price = price_by.get((t, partner_id)) or p.get("standard_price") or 0
+        elif t in primary:
+            partner_id, pname, price = primary[t]
+        else:
             novendor.append(sku)
             continue
-        partner_id, pname, price = info
         uom = p["uom_po_id"][0] if p.get("uom_po_id") else None
-        groups[(partner_id, pname)].append(
-            (p["id"], p["name"], qty, uom, price or p.get("standard_price") or 0)
-        )
+        groups[(partner_id, pname)].append((p["id"], p["name"], qty, uom, price))
 
     date_planned = args.date_planned or (datetime.date.today() + datetime.timedelta(days=90)).isoformat()
-    print(f"qty>0 rows: {len(wanted)} | matched: {len(by_sku)} | missing SKUs: {len(missing)} | no-vendor: {len(novendor)}")
+    print(f"qty>0: {len(wanted)} | matched: {len(by_sku)} | missing: {len(missing)} | "
+          f"exceptions applied: {sum(1 for s in wanted if s in exceptions)} | unresolved: {len(novendor)}")
     for (partner_id, pname), lines in groups.items():
         print(f"  {pname}: {len(lines)} lines, total qty {sum(x[2] for x in lines):.0f}")
         if args.dry_run:
@@ -103,7 +138,7 @@ def main() -> None:
     if missing:
         print("  missing SKUs:", missing[:10])
     if novendor:
-        print("  no-vendor SKUs:", novendor[:10])
+        print("  unresolved:", novendor[:10])
 
 
 if __name__ == "__main__":

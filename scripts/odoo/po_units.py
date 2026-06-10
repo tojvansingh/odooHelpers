@@ -1,6 +1,6 @@
 """Total units on order in one or more POs (ordered / received / remaining).
 
-Run: cd inventorymgr && uv run python scripts/odoo/po_units.py --po P60165 [--po ...] [--prod]
+Run: cd odooHelpers && uv run python scripts/odoo/po_units.py --po P60165 [--po ...] [--prod]
 """
 
 from __future__ import annotations

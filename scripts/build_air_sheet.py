@@ -13,7 +13,7 @@ Three tabs:
   - "AIR vs SEA": one row per product; every derived cell is a live formula.
 
 Run:
-  cd inventorymgr && PYTHONPATH=src uv run python scripts/build_air_sheet.py --prod \
+  cd odooHelpers && PYTHONPATH=src uv run python scripts/build_air_sheet.py --prod \
       --po P60165 --po P60167  [--target 2026-08-31 --target 2026-09-30]
 """
 

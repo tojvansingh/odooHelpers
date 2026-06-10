@@ -44,7 +44,7 @@ def odoo_settings(profile: str = "local") -> OdooSettings:
         )
     except KeyError as exc:
         raise RuntimeError(
-            f"Missing Odoo setting {exc} for profile {profile!r} — set it in inventorymgr/.env"
+            f"Missing Odoo setting {exc} for profile {profile!r} — set it in odooHelpers/.env"
         ) from exc
 
 
@@ -60,7 +60,7 @@ def google_settings() -> GoogleSettings:
         raw_path = os.environ["GOOGLE_SA_JSON"]
         folder_id = os.environ["GDRIVE_FOLDER_ID"]
     except KeyError as exc:
-        raise RuntimeError(f"Missing Google setting {exc} — set it in inventorymgr/.env") from exc
+        raise RuntimeError(f"Missing Google setting {exc} — set it in odooHelpers/.env") from exc
     path = Path(raw_path)
     if not path.is_absolute():
         path = PROJECT_ROOT / path

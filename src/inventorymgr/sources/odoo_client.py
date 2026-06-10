@@ -21,7 +21,7 @@ class OdooClient:
         if self._uid is None:
             uid = self._common.authenticate(self.s.db, self.s.user, self.s.api_key, {})
             if not uid:
-                raise RuntimeError("Odoo authentication failed — check inventorymgr/.env")
+                raise RuntimeError("Odoo authentication failed — check odooHelpers/.env")
             self._uid = uid
         return self._uid
 

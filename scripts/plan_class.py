@@ -1,6 +1,6 @@
 """Generate a plan for one Class from live Odoo and print it (eyeball / sanity check).
 
-Run: cd inventorymgr && PYTHONPATH=src uv run python scripts/plan_class.py --class "Dish Towels"
+Run: cd odooHelpers && PYTHONPATH=src uv run python scripts/plan_class.py --class "Dish Towels"
 """
 
 from __future__ import annotations

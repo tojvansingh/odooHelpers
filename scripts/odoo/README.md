@@ -4,7 +4,7 @@ Small, callable scripts for ad-hoc Odoo interactions — a running tally of thin
 Run from the project root:
 
 ```
-cd inventorymgr
+cd odooHelpers
 uv run python scripts/odoo/<script>.py [args] [--prod]
 ```
 

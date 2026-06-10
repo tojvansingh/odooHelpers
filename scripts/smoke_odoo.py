@@ -1,6 +1,6 @@
 """Connectivity check: authenticate to Odoo and run a couple of read-only queries.
 
-Run: cd inventorymgr && PYTHONPATH=src uv run python scripts/smoke_odoo.py
+Run: cd odooHelpers && PYTHONPATH=src uv run python scripts/smoke_odoo.py
 """
 
 import argparse

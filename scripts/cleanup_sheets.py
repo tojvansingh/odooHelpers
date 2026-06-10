@@ -4,7 +4,7 @@ Dry run by default; pass --apply to move matches to Drive trash (recoverable 30 
 Targets smoke tests and the old dated "AIR Plan 2026-..." sheets (superseded by the
 single reused "AIR Plan — <POs>" sheet). Leaves everything else (incl. plan sheets).
 
-Run: cd inventorymgr && PYTHONPATH=src uv run python scripts/cleanup_sheets.py [--apply]
+Run: cd odooHelpers && PYTHONPATH=src uv run python scripts/cleanup_sheets.py [--apply]
 """
 
 from __future__ import annotations

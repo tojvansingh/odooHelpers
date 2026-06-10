@@ -1,6 +1,6 @@
 """Connectivity check for Google Sheets: create a sheet in the shared folder and write to it.
 
-Run: cd inventorymgr && PYTHONPATH=src uv run python scripts/smoke_gsheets.py
+Run: cd odooHelpers && PYTHONPATH=src uv run python scripts/smoke_gsheets.py
 """
 
 from __future__ import annotations

@@ -1,6 +1,6 @@
 """Pull from Odoo, assemble plans, and write a review Google Sheet.
 
-Run: cd inventorymgr && PYTHONPATH=src uv run python scripts/build_plan_sheet.py --class "Dish Towels"
+Run: cd odooHelpers && PYTHONPATH=src uv run python scripts/build_plan_sheet.py --class "Dish Towels"
 """
 
 from __future__ import annotations

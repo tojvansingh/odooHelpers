@@ -17,6 +17,7 @@ from inventorymgr.air import (
     commercial_partner_map,
     fetch_booked_outgoing,
     fetch_lastyear_buyers_by_month,
+    fetch_ready_incoming,
     last_day_of_month,
 )
 from inventorymgr.assemble import assemble_plan, horizon_length, horizon_months
@@ -26,7 +27,6 @@ from inventorymgr.sources.gsheets import GSheets
 from inventorymgr.sources.odoo_client import OdooClient
 from inventorymgr.sources.odoo_source import (
     read_monthly_sales,
-    read_open_po_remaining,
     read_product_ids_for_vendor,
     read_products_by_class,
 )
@@ -71,7 +71,11 @@ def main() -> None:
             raise SystemExit(f"No products for {cls} (collection={args.collection}, vendor={args.vendor})")
 
         sales = read_monthly_sales(client, pids)
-        remaining = read_open_po_remaining(client, pids)
+        # Incoming = Ready receipts only (stock.move state=assigned, incoming), dated by the
+        # move's own scheduled date — excludes cancelled/done receipts and stale PO-line dates.
+        remaining: dict[int, list] = {}
+        for m in fetch_ready_incoming(client, pids):
+            remaining.setdefault(m["pid"], []).append((m["date"][:7] if m["date"] else None, m["qty"]))
         n = horizon_override or horizon_length(params)
         months = horizon_months(today.year, today.month, n)
         src_lo, src_hi = (months[0][0] - 1, months[0][1]), (months[-1][0] - 1, months[-1][1])

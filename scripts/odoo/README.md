@@ -23,6 +23,7 @@ uv run python scripts/odoo/<script>.py [args] [--prod]
 | `create_pos.py` | Draft POs in **LOCAL** Odoo from a plan sheet's Order Qty (final), grouped by vendor | `... create_pos.py --sheet <KEY> --tab "Dish Towels" --date-planned 2026-11-15` |
 | `split_receipt.py` | Split a PO receipt into AIR + SEA receipts with separate dates (**LOCAL** only) | `... split_receipt.py --po P60165 --air "001D:100" --air-date 2026-08-15 --sea-date 2026-11-15` |
 | `cleanup_sheets.py` | Trash obsolete generated sheets in the Drive folder | `... cleanup_sheets.py --apply` |
+| `build_warehouse_dashboard.py` | Refresh the "Warehouse Dashboard" Google Sheet: production output + backlog by Class, retail/wholesale shipments, late & blocked orders | `... build_warehouse_dashboard.py --prod` |
 
 ## Requested / not yet built
 

@@ -20,7 +20,7 @@ from inventorymgr.air import (
     last_day_of_month,
 )
 from inventorymgr.assemble import assemble_plan, horizon_length, horizon_months
-from inventorymgr.config import load_class_params
+from inventorymgr.config import load_class_params, resolve_class_params
 from inventorymgr.sheets_output import build_review_spreadsheet
 from inventorymgr.sources.gsheets import GSheets
 from inventorymgr.sources.odoo_client import OdooClient
@@ -56,7 +56,7 @@ def main() -> None:
 
     blocks: dict = {}
     for cls in classes:
-        params = params_all.get(cls)
+        params = resolve_class_params(params_all, cls, args.collection)
         if params is None:
             raise SystemExit(f"No params for class {cls!r} in data/class_params.csv")
         products = read_products_by_class(client, cls)

@@ -13,18 +13,25 @@ def _int_or_none(v: str | None) -> int | None:
     return int(float(v)) if v else None
 
 
-def load_class_params(path: Path = DEFAULT_PARAMS_CSV) -> dict[str, ClassParams]:
-    """Load per-Class lead/transit/MOQ parameters from the CSV the user maintains."""
-    out: dict[str, ClassParams] = {}
+def load_class_params(path: Path = DEFAULT_PARAMS_CSV) -> dict[tuple[str, str], ClassParams]:
+    """Load planning params keyed by (class, collection). collection "" = the class default."""
+    out: dict[tuple[str, str], ClassParams] = {}
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
             name = (row.get("class") or "").strip()
             if not name:
                 continue
-            out[name] = ClassParams(
+            coll = (row.get("collection") or "").strip()
+            out[(name, coll)] = ClassParams(
                 class_name=name,
+                collection=coll,
                 lead_days=_int_or_none(row.get("lead_days")),
                 transit_days=_int_or_none(row.get("transit_days")),
                 moq_step=_int_or_none(row.get("moq_step")),
             )
     return out
+
+
+def resolve_class_params(pmap: dict, class_name: str, collection: str = "") -> ClassParams | None:
+    """A (class, collection) override if present, else the (class, "") default."""
+    return pmap.get((class_name, (collection or "").strip())) or pmap.get((class_name, ""))

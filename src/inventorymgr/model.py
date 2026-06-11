@@ -5,12 +5,13 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class ClassParams:
-    """Per-product-Class planning parameters (lead time, transit, MOQ rounding)."""
+    """Per-Class (optionally per-Collection) planning parameters (lead, transit, MOQ)."""
 
     class_name: str
     lead_days: int | None = None
     transit_days: int | None = None
     moq_step: int | None = None
+    collection: str = ""  # "" = default for the class; else a collection-specific override
 
 
 @dataclass

@@ -51,12 +51,16 @@ def main() -> None:
     ap.add_argument("--vendor", help="default vendor for all lines (else supplierinfo primary)")
     ap.add_argument("--qty-col", default="Order Qty (final)")
     ap.add_argument("--date-planned", default=None)
+    ap.add_argument("--prod", action="store_true", help="create in PRODUCTION (default: local)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    c = OdooClient(profile="local")
-    if not any(h in c.s.url for h in ("localhost", "127.0.0.1")):
-        raise SystemExit(f"Refusing to run: not local Odoo ({c.s.url})")
+    c = OdooClient(profile="prod" if args.prod else "local")
+    is_local = any(h in c.s.url for h in ("localhost", "127.0.0.1"))
+    if not args.prod and not is_local:
+        raise SystemExit(f"Refusing: local profile is not localhost ({c.s.url})")
+    if args.prod:
+        print(f"*** PRODUCTION write target: {c.s.url} ***")
 
     ws = GSheets().open_by_key(args.sheet).worksheet(args.tab)
     vals = ws.get_all_values()

@@ -1,7 +1,7 @@
 """Split a PO's incoming receipt into an AIR receipt and a SEA receipt with separate
 scheduled dates, so air-freighted and sea-freighted quantities can be tracked apart.
 
-LOCAL ONLY — hard-refuses any non-localhost Odoo.
+Defaults to LOCAL (refuses non-localhost); pass --prod to target production.
 
 Air quantities come either from --air "SKU:qty,SKU:qty" or from an AIR sheet column.
 
@@ -48,12 +48,15 @@ def main() -> None:
     ap.add_argument("--air-col", default="AIR Aug-31")
     ap.add_argument("--air-date", required=True, help="YYYY-MM-DD")
     ap.add_argument("--sea-date", required=True, help="YYYY-MM-DD")
+    ap.add_argument("--prod", action="store_true", help="target PRODUCTION (default: local)")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    c = OdooClient(profile="local")
-    if not any(h in c.s.url for h in ("localhost", "127.0.0.1")):
-        raise SystemExit(f"Refusing to run: not local Odoo ({c.s.url})")
+    c = OdooClient(profile="prod" if args.prod else "local")
+    if args.prod:
+        print(f"*** PRODUCTION write target: {c.s.url} ***")
+    elif not any(h in c.s.url for h in ("localhost", "127.0.0.1")):
+        raise SystemExit(f"Refusing: local profile is not localhost ({c.s.url})")
 
     if args.air:
         air_by_sku = {p.split(":")[0].strip(): float(p.split(":")[1]) for p in args.air.split(",")}

@@ -239,14 +239,20 @@ def fetch_shipments(
 
 def fetch_open_exceptions(
     client: OdooClient, tz: ZoneInfo, ptype_ids: list[int], today: dt.date
-) -> dict[str, dict[str, float]]:
-    """Open customer deliveries due today or earlier, rolled up per sale order.
+) -> dict:
+    """Open customer deliveries due today or earlier, rolled up and itemized per sale order.
 
-    Returns {bucket: {'orders': n, 'total': $ order totals, 'unshipped': $ not yet shipped}}
-    for buckets: due_mfg (#5), late (#6), late_mfg (#7a), late_inv (#7b), late_ready.
+    Returns {
+      'summary': {bucket: {'orders', 'total', 'unshipped'}} for buckets
+                 due_mfg (#5), late (#6), late_mfg (#7a), late_inv (#7b), late_ready,
+      'orders':  [per-order dict: name, partner, scheduled (local date), days_late,
+                  total, unshipped, late, mfg, inv, waiting (sorted item names)],
+    }
     """
     tomorrow_utc = utc_str(today + dt.timedelta(days=1), tz)
     today_utc = utc_str(today, tz)
+    empty_summary = {k: {"orders": 0, "total": 0.0, "unshipped": 0.0}
+                     for k in ("due_mfg", "late", "late_mfg", "late_inv", "late_ready")}
     picks = client.search_read(
         "stock.picking",
         [["picking_type_id", "in", ptype_ids], ["state", "in", list(OPEN_PICKING_STATES)],
@@ -254,9 +260,9 @@ def fetch_open_exceptions(
         ["sale_id", "scheduled_date"],
     )
     if not picks:
-        return {k: {"orders": 0, "total": 0.0, "unshipped": 0.0}
-                for k in ("due_mfg", "late", "late_mfg", "late_inv", "late_ready")}
+        return {"summary": empty_summary, "orders": []}
     pick_order = {p["id"]: _m2o_id(p["sale_id"]) for p in picks}
+    order_name = {_m2o_id(p["sale_id"]): _m2o_name(p["sale_id"]) for p in picks}
     moves = client.search_read(
         "stock.move",
         [["picking_id", "in", list(pick_order)], ["state", "not in", ["done", "cancel"]]],
@@ -294,30 +300,135 @@ def fetch_open_exceptions(
 
     # Per-order rollup across that order's open pickings.
     orders: dict[int, dict] = defaultdict(
-        lambda: {"late": False, "mfg": False, "inv": False, "unshipped": 0.0})
+        lambda: {"late": False, "mfg": False, "inv": False, "unshipped": 0.0,
+                 "sched": None, "waiting": set()})
     for p in picks:
         o = orders[pick_order[p["id"]]]
         o["late"] = o["late"] or (p["scheduled_date"] < today_utc)
+        d = local_date(p["scheduled_date"], tz)
+        o["sched"] = d if o["sched"] is None else min(o["sched"], d)
     for m in moves:
         o = orders[pick_order[_m2o_id(m["picking_id"])]]
         o["unshipped"] += value_of(m, m.get("product_uom_qty") or 0)
         if m["state"] in UNSATISFIED_MOVE_STATES:
             o["mfg" if blocked_by_mfg(m) else "inv"] = True
-    totals = {r["id"]: r.get("amount_total") or 0 for r in client.search_read(
-        "sale.order", [["id", "in", list(orders)]], ["amount_total"])}
+            o["waiting"].add(_m2o_name(m["product_id"]))
+    so_recs = client.search_read(
+        "sale.order", [["id", "in", list(orders)]], ["amount_total", "partner_id"])
+    totals = {r["id"]: r.get("amount_total") or 0 for r in so_recs}
+    partners = {r["id"]: _m2o_name(r.get("partner_id")) for r in so_recs}
 
-    def rollup(order_ids) -> dict[str, float]:
-        return {
-            "orders": len(order_ids),
-            "total": sum(totals.get(i, 0) for i in order_ids),
-            "unshipped": sum(orders[i]["unshipped"] for i in order_ids),
-        }
+    order_rows = []
+    for oid, o in orders.items():
+        order_rows.append({
+            "name": order_name.get(oid, str(oid)),
+            "partner": partners.get(oid, ""),
+            "scheduled": o["sched"],
+            "days_late": (today - o["sched"]).days if o["sched"] else 0,
+            "total": totals.get(oid, 0.0),
+            "unshipped": o["unshipped"],
+            "late": o["late"], "mfg": o["mfg"], "inv": o["inv"],
+            "waiting": sorted(o["waiting"]),
+        })
 
-    late = [i for i, o in orders.items() if o["late"]]
-    return {
-        "due_mfg": rollup([i for i, o in orders.items() if o["mfg"]]),
+    def rollup(rows) -> dict[str, float]:
+        return {"orders": len(rows), "total": sum(r["total"] for r in rows),
+                "unshipped": sum(r["unshipped"] for r in rows)}
+
+    late = [r for r in order_rows if r["late"]]
+    summary = {
+        "due_mfg": rollup([r for r in order_rows if r["mfg"]]),
         "late": rollup(late),
-        "late_mfg": rollup([i for i in late if orders[i]["mfg"]]),
-        "late_inv": rollup([i for i in late if not orders[i]["mfg"] and orders[i]["inv"]]),
-        "late_ready": rollup([i for i in late if not orders[i]["mfg"] and not orders[i]["inv"]]),
+        "late_mfg": rollup([r for r in late if r["mfg"]]),
+        "late_inv": rollup([r for r in late if not r["mfg"] and r["inv"]]),
+        "late_ready": rollup([r for r in late if not r["mfg"] and not r["inv"]]),
     }
+    return {"summary": summary, "orders": order_rows}
+
+
+def fetch_mo_blocking_map(
+    client: OdooClient, tz: ZoneInfo, ptype_ids: list[int], today: dt.date
+) -> dict[int, dict]:
+    """{mo_id: {'sos': [order names], 'late': bool}} for MOs feeding an open delivery.
+
+    Built from the reverse of created_production_id on open delivery moves, so an MO
+    can be flagged as blocking specific customer orders (and whether any is past due).
+    """
+    today_utc = utc_str(today, tz)
+    dmoves = client.search_read(
+        "stock.move",
+        [["picking_id.picking_type_id", "in", ptype_ids],
+         ["state", "not in", ["done", "cancel"]], ["created_production_id", "!=", False]],
+        ["created_production_id", "picking_id"],
+    )
+    if not dmoves:
+        return {}
+    pick_ids = list({_m2o_id(m["picking_id"]) for m in dmoves})
+    picks = {p["id"]: p for p in client.search_read(
+        "stock.picking", [["id", "in", pick_ids]], ["sale_id", "scheduled_date"])}
+    out: dict[int, dict] = defaultdict(lambda: {"sos": set(), "late": False})
+    for m in dmoves:
+        mo = _m2o_id(m["created_production_id"])
+        p = picks.get(_m2o_id(m["picking_id"]))
+        if not p:
+            continue
+        if p.get("sale_id"):
+            out[mo]["sos"].add(_m2o_name(p["sale_id"]))
+        if p.get("scheduled_date") and p["scheduled_date"] < today_utc:
+            out[mo]["late"] = True
+    return {mo: {"sos": sorted(v["sos"]), "late": v["late"]} for mo, v in out.items()}
+
+
+def fetch_mo_details(
+    client: OdooClient, tz: ZoneInfo, today: dt.date, blocking: dict[int, dict]
+) -> list[dict]:
+    """Per open MO: name, product, class, qty to make, scheduled start, due bucket,
+    days late, subcontract flag, component status, and which customer orders it blocks."""
+    rows = client.search_read(
+        "mrp.production",
+        [["state", "not in", ["done", "cancel"]]],
+        ["name", "product_id", "product_qty", "qty_produced", "date_start",
+         "components_availability", "picking_type_id"],
+    )
+    classes = _classes_for(client, {_m2o_id(r["product_id"]) for r in rows})
+    out = []
+    for r in rows:
+        remaining = max((r.get("product_qty") or 0) - (r.get("qty_produced") or 0), 0)
+        if not remaining:
+            continue
+        start = local_date(r["date_start"], tz) if r.get("date_start") else today
+        blk = blocking.get(r["id"], {})
+        out.append({
+            "name": r["name"],
+            "product": _m2o_name(r["product_id"]),
+            "klass": classes[_m2o_id(r["product_id"])],
+            "qty": remaining,
+            "start": start,
+            "bucket": due_bucket(start, today),
+            "days_late": max((today - start).days, 0),
+            "subcontract": "subcontract" in _m2o_name(r.get("picking_type_id")).lower(),
+            "components": r.get("components_availability") or "",
+            "blocking_sos": blk.get("sos", []),
+            "blocking_late": blk.get("late", False),
+        })
+    return out
+
+
+def delivery_detail_sections(exc: dict) -> list[tuple[str, str, list[dict]]]:
+    """Split the open-delivery orders into the same buckets the summary tab shows.
+
+    Returns [(section key, title, [order rows sorted by days late desc])] mirroring
+    the summary rows: due_mfg, late_mfg, late_inv, late_ready. (late_mfg orders also
+    appear under due_mfg, exactly as the summary double-counts them.)
+    """
+    orders = exc["orders"]
+    late = [r for r in orders if r["late"]]
+    groups = {
+        "due_mfg": ("Due to ship, waiting on manufacturing", [r for r in orders if r["mfg"]]),
+        "late_mfg": ("Late — waiting on manufacturing", [r for r in late if r["mfg"]]),
+        "late_inv": ("Late — waiting on inventory (not manufacturing)",
+                     [r for r in late if not r["mfg"] and r["inv"]]),
+        "late_ready": ("Late — ready to ship", [r for r in late if not r["mfg"] and not r["inv"]]),
+    }
+    return [(k, title, sorted(rows, key=lambda r: -r["days_late"]))
+            for k, (title, rows) in groups.items()]

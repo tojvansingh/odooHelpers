@@ -42,6 +42,7 @@ REQUIRE_AC = False
 STAMP_FILE = pathlib.Path.home() / "Library/Application Support/warehouse-dashboard/last_success.txt"
 
 SLATE = {"red": 0.247, "green": 0.317, "blue": 0.376}
+STEEL = {"red": 0.60, "green": 0.66, "blue": 0.71}          # subsection band (lighter slate)
 WHITE = {"red": 1, "green": 1, "blue": 1}
 HEADER_BG = {"red": 0.937, "green": 0.937, "blue": 0.937}
 TOTAL_BG = {"red": 0.965, "green": 0.965, "blue": 0.965}
@@ -53,6 +54,8 @@ KIND_FORMATS = {
     "title": {"textFormat": {"bold": True, "fontSize": 12}},
     "section": {"backgroundColor": SLATE,
                 "textFormat": {"bold": True, "foregroundColor": WHITE}},
+    "subsection": {"backgroundColor": STEEL,
+                   "textFormat": {"bold": True, "foregroundColor": WHITE}},
     "header": {"backgroundColor": HEADER_BG, "textFormat": {"bold": True},
                "horizontalAlignment": "CENTER",
                "borders": {"bottom": {"style": "SOLID"}}},
@@ -65,7 +68,10 @@ DEC_FMT = {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.0"}}
 USD = {"numberFormat": {"type": "CURRENCY", "pattern": "$#,##0"}}
 TAB_COLORS = {
     "Manufacturing": {"red": 0.31, "green": 0.51, "blue": 0.74},
+    "MO Detail": {"red": 0.60, "green": 0.73, "blue": 0.88},
     "Shipping": {"red": 0.42, "green": 0.66, "blue": 0.31},
+    "SO Detail": {"red": 0.65, "green": 0.80, "blue": 0.56},
+    "Production Plan": {"red": 0.90, "green": 0.57, "blue": 0.22},
 }
 
 
@@ -77,6 +83,7 @@ class TabGrid:
         self.kinds: list[str] = []          # one of KIND_FORMATS keys or "data"
         self.fmts: list[tuple[str, dict]] = []   # (A1 range, cell format)
         self.pastdue_ranges: list[str] = []      # red-highlight when > 0
+        self.col_widths: list[int] | None = None  # per-column px; None = default scheme
 
     def add(self, cells: list | None = None, kind: str = "data") -> int:
         self.rows.append(cells or [])
@@ -108,7 +115,7 @@ def _backlog_table(g: TabGrid, title: str, backlog) -> None:
         g.pastdue_ranges.append(f"B{hdr + 1}:B{last - 1}")
 
 
-def build_manufacturing_tab(output, backlog, subcon, days, today, month_label, wd_elapsed) -> TabGrid:
+def build_manufacturing_tab(output, backlog, subcon, days, today, month_label, wd_elapsed, tz_name) -> TabGrid:
     g = TabGrid()
     g.add([f"MANUFACTURING — refreshed {dt.datetime.now():%Y-%m-%d %H:%M}"], kind="title")
     g.add()
@@ -135,10 +142,22 @@ def build_manufacturing_tab(output, backlog, subcon, days, today, month_label, w
     _backlog_table(g, "Open MO backlog — units to make in-house, by scheduled start", backlog)
     g.add()
     _backlog_table(g, "Subcontracted backlog — units on order with outside vendors", subcon)
+
+    g.add()
+    for note in (
+        "Units finished = quantity produced on completed (done) in-house MOs, by finish date"
+        f" in {tz_name}. Subcontracted MOs are excluded from this table.",
+        "Backlog = units still to make on open MOs (qty to produce − already produced),"
+        " bucketed by the MO's scheduled start date vs today: Past due = start date before"
+        " today; Next 2 weeks = within 14 days; 2–4 weeks = 14–28 days; >4 weeks = beyond.",
+        "In-house = MOs run at Petaluma; Subcontracted = MOs fulfilled by outside vendors"
+        " (WH/SBC). See the 'MO Detail' tab for the individual MOs behind each bucket.",
+    ):
+        g.add([note], kind="note")
     return g
 
 
-def build_shipping_tab(ships, exc, days, today, month_label, wd_elapsed, tz_name) -> TabGrid:
+def build_shipping_tab(ships, summary, days, today, month_label, wd_elapsed, tz_name) -> TabGrid:
     g = TabGrid()
     g.add([f"SHIPPING — refreshed {dt.datetime.now():%Y-%m-%d %H:%M}"], kind="title")
     g.add()
@@ -181,7 +200,7 @@ def build_shipping_tab(ships, exc, days, today, month_label, wd_elapsed, tz_name
         ("   late — waiting on inventory (not mfg)", "late_inv", "data"),
         ("   late — ready to ship", "late_ready", "data"),
     ):
-        e = exc[key]
+        e = summary[key]
         r = g.add([label, e["orders"], round(e["total"]), round(e["unshipped"])], kind=kind)
         g.fmt(f"B{r}:B{r}", INT_FMT)
         g.fmt(f"C{r}:D{r}", USD)
@@ -191,9 +210,90 @@ def build_shipping_tab(ships, exc, days, today, month_label, wd_elapsed, tz_name
         f"Retail = order source in: {', '.join(sorted(RETAIL_SOURCES))}; everything else is wholesale.",
         "$ per day = sale-line value shipped that day (excl. tax, after discounts);"
         " $ Order Total = full order amount incl. tax/shipping.",
+        "An order is counted under a row if it has an open (not-yet-done) outgoing delivery"
+        " whose scheduled date is today or earlier. Late = that scheduled date is before today.",
         "Waiting on manufacturing = a short item on the delivery is tied to an open MO,"
-        " or its product has an open MO or a BOM. Otherwise: waiting on inventory.",
-        f"Late = open delivery past its scheduled date. Days bucketed in {tz_name}.",
+        " or its product has an open MO or a BOM. Otherwise: waiting on inventory; ready = stock"
+        " on hand but not yet shipped. See the 'SO Detail' tab for the individual orders.",
+        f"Late-mfg orders also appear under 'Due to ship, waiting on manufacturing'. Dates in {tz_name}.",
+    ):
+        g.add([note], kind="note")
+    return g
+
+
+MO_DETAIL_COLS = ["MO", "Product", "Class", "Qty to make", "Start", "Days late", "Components", "Blocking orders"]
+MO_DETAIL_WIDTHS = [115, 270, 110, 90, 90, 80, 115, 230]
+SO_DETAIL_COLS = ["Order", "Customer", "Scheduled", "Days late", "$ Order Total", "$ Unshipped", "Waiting on"]
+SO_DETAIL_WIDTHS = [95, 230, 95, 80, 105, 105, 320]
+
+
+def build_mo_detail_tab(mo_details, today, tz_name) -> TabGrid:
+    g = TabGrid()
+    g.col_widths = MO_DETAIL_WIDTHS
+    g.add([f"MO DETAIL — open manufacturing orders behind the backlog, refreshed {dt.datetime.now():%Y-%m-%d %H:%M}"],
+          kind="title")
+    for sub, label in ((False, "In-house MOs"), (True, "Subcontracted MOs")):
+        items = [m for m in mo_details if m["subcontract"] == sub]
+        g.add()
+        g.add([f"{label} — {len(items)} open MOs, {int(round(sum(m['qty'] for m in items))):,} units"],
+              kind="section")
+        if not items:
+            g.add(["(none)"], kind="note")
+            continue
+        for bucket in wm.DUE_BUCKETS:
+            brows = sorted([m for m in items if m["bucket"] == bucket], key=lambda m: -m["qty"])
+            if not brows:
+                continue
+            units = int(round(sum(m["qty"] for m in brows)))
+            g.add([f"{bucket} — {len(brows)} MOs, {units:,} units"], kind="subsection")
+            hdr = g.add(MO_DETAIL_COLS, kind="header")
+            for m in brows:
+                blocking = ", ".join(m["blocking_sos"])
+                if m["blocking_sos"] and m["blocking_late"]:
+                    blocking = "⚠ " + blocking
+                g.add([m["name"], m["product"], m["klass"], _num(m["qty"]),
+                       f"{m['start']:%Y-%m-%d}", m["days_late"] or "", m["components"], blocking])
+            g.fmt(f"D{hdr + 1}:D{len(g.rows)}", INT_FMT)
+            if bucket == wm.DUE_BUCKETS[0]:
+                g.fmt(f"F{hdr + 1}:F{len(g.rows)}", {"textFormat": {"foregroundColor": {"red": 0.7}}})
+    g.add()
+    for note in (
+        "One row per open MO with units still to make. Class/bucket match the Manufacturing tab"
+        " (bucket = scheduled start vs today; Past due = start before today).",
+        "Components = Odoo's component-availability status for the MO (e.g. Available / Not Available).",
+        "Blocking orders = customer sale orders waiting on this MO (via the make-to-order link);"
+        " ⚠ marks that at least one of those deliveries is already past its scheduled date.",
+    ):
+        g.add([note], kind="note")
+    return g
+
+
+def build_so_detail_tab(exc, today, tz_name) -> TabGrid:
+    g = TabGrid()
+    g.col_widths = SO_DETAIL_WIDTHS
+    g.add([f"SO DETAIL — open customer deliveries behind the Shipping summary, refreshed {dt.datetime.now():%Y-%m-%d %H:%M}"],
+          kind="title")
+    for _key, title, rows in wm.delivery_detail_sections(exc):
+        total = int(round(sum(r["total"] for r in rows)))
+        g.add()
+        g.add([f"{title} — {len(rows)} orders, ${total:,} order value"], kind="section")
+        if not rows:
+            g.add(["(none)"], kind="note")
+            continue
+        hdr = g.add(SO_DETAIL_COLS, kind="header")
+        for r in rows:
+            sched = f"{r['scheduled']:%Y-%m-%d}" if r["scheduled"] else ""
+            waiting = ", ".join(r["waiting"][:5]) + (" …" if len(r["waiting"]) > 5 else "")
+            g.add([r["name"], r["partner"], sched, r["days_late"] if r["days_late"] > 0 else "",
+                   round(r["total"]), round(r["unshipped"]), waiting])
+        g.fmt(f"D{hdr + 1}:D{len(g.rows)}", INT_FMT)
+        g.fmt(f"E{hdr + 1}:F{len(g.rows)}", USD)
+    g.add()
+    for note in (
+        "Sections mirror the Shipping summary's open-deliveries rows. Days late = today −"
+        " the order's earliest open-delivery scheduled date.",
+        "Waiting on = the specific items on the delivery that aren't yet available (first 5 shown).",
+        "Late-mfg orders also appear under 'Due to ship, waiting on manufacturing', matching the summary.",
     ):
         g.add([note], kind="note")
     return g
@@ -241,13 +341,23 @@ def write_tab(sh, name: str, g: TabGrid) -> None:
     fmts += [{"range": rng, "format": f} for rng, f in g.fmts]
     ws.batch_format(fmts)
 
-    reqs = [
-        {"updateDimensionProperties": {
-            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
-            "properties": {"pixelSize": 310}, "fields": "pixelSize"}},
-        {"updateDimensionProperties": {
-            "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": n_cols},
-            "properties": {"pixelSize": 95}, "fields": "pixelSize"}},
+    if g.col_widths:
+        width_reqs = [
+            {"updateDimensionProperties": {
+                "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": i, "endIndex": i + 1},
+                "properties": {"pixelSize": px}, "fields": "pixelSize"}}
+            for i, px in enumerate(g.col_widths)
+        ]
+    else:
+        width_reqs = [
+            {"updateDimensionProperties": {
+                "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 1},
+                "properties": {"pixelSize": 310}, "fields": "pixelSize"}},
+            {"updateDimensionProperties": {
+                "range": {"sheetId": ws.id, "dimension": "COLUMNS", "startIndex": 1, "endIndex": n_cols},
+                "properties": {"pixelSize": 95}, "fields": "pixelSize"}},
+        ]
+    reqs = width_reqs + [
         {"updateSheetProperties": {
             "properties": {"sheetId": ws.id, "tabColorStyle": {"rgbColor": TAB_COLORS.get(name, SLATE)}},
             "fields": "tabColorStyle"}},
@@ -267,6 +377,8 @@ def write_sheet(title: str, grids: dict[str, TabGrid]) -> str:
     for w in sh.worksheets():
         if w.title not in grids and w.title == "Sheet1":
             sh.del_worksheet(w)
+    ordered = [sh.worksheet(name) for name in grids]  # detail tab after its summary
+    sh.reorder_worksheets(ordered)
     return sh.url
 
 
@@ -301,10 +413,14 @@ def build_dashboard(args) -> None:
     backlog, subcon = wm.fetch_production_backlog(client, tz, today)
     ships = wm.fetch_shipments(client, tz, ptype_ids, since, RETAIL_SOURCES)
     exc = wm.fetch_open_exceptions(client, tz, ptype_ids, today)
+    blocking = wm.fetch_mo_blocking_map(client, tz, ptype_ids, today)
+    mo_details = wm.fetch_mo_details(client, tz, today, blocking)
 
     grids = {
-        "Manufacturing": build_manufacturing_tab(output, backlog, subcon, days, today, month_label, wd_elapsed),
-        "Shipping": build_shipping_tab(ships, exc, days, today, month_label, wd_elapsed, str(tz)),
+        "Manufacturing": build_manufacturing_tab(output, backlog, subcon, days, today, month_label, wd_elapsed, str(tz)),
+        "MO Detail": build_mo_detail_tab(mo_details, today, str(tz)),
+        "Shipping": build_shipping_tab(ships, exc["summary"], days, today, month_label, wd_elapsed, str(tz)),
+        "SO Detail": build_so_detail_tab(exc, today, str(tz)),
     }
     for name, g in grids.items():
         print_grid(name, g)

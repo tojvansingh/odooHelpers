@@ -35,9 +35,10 @@ DEFAULT_TITLE = "Warehouse Dashboard"
 RETAIL_SOURCES = {"Shopify Retail", "Amazon FBA", "Amazon FBM"}
 
 # Scheduler (--if-due) settings: refresh once per evening, the next time the laptop is
-# awake + plugged in. Flip REQUIRE_AC to False to also run on battery.
+# awake. Set REQUIRE_AC True to only run while plugged in (risks never running if the
+# laptop is only ever awake on battery).
 RUN_HOUR, RUN_MINUTE = 16, 30
-REQUIRE_AC = True
+REQUIRE_AC = False
 STAMP_FILE = pathlib.Path.home() / "Library/Application Support/warehouse-dashboard/last_success.txt"
 
 SLATE = {"red": 0.247, "green": 0.317, "blue": 0.376}

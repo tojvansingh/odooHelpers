@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import pathlib
+import subprocess
 import sys
 from zoneinfo import ZoneInfo
 
@@ -32,6 +33,12 @@ from inventorymgr.sources.odoo_client import OdooClient  # noqa: E402
 DEFAULT_TITLE = "Warehouse Dashboard"
 # Channel split by the sale order's "Order Source"; anything not listed is wholesale.
 RETAIL_SOURCES = {"Shopify Retail", "Amazon FBA", "Amazon FBM"}
+
+# Scheduler (--if-due) settings: refresh once per evening, the next time the laptop is
+# awake + plugged in. Flip REQUIRE_AC to False to also run on battery.
+RUN_HOUR, RUN_MINUTE = 16, 30
+REQUIRE_AC = True
+STAMP_FILE = pathlib.Path.home() / "Library/Application Support/warehouse-dashboard/last_success.txt"
 
 SLATE = {"red": 0.247, "green": 0.317, "blue": 0.376}
 WHITE = {"red": 1, "green": 1, "blue": 1}
@@ -267,8 +274,17 @@ def main() -> None:
     ap.add_argument("--prod", action="store_true", help="use the production Odoo profile")
     ap.add_argument("--title", default=DEFAULT_TITLE, help="spreadsheet name to create/reuse")
     ap.add_argument("--dry-run", action="store_true", help="print metrics; don't touch Google Sheets")
+    ap.add_argument("--if-due", action="store_true",
+                    help="scheduler mode: only refresh when on AC power and a run is owed "
+                         f"since {RUN_HOUR:02d}:{RUN_MINUTE:02d}; records success to skip repeats")
     args = ap.parse_args()
+    if args.if_due:
+        run_if_due(args)
+    else:
+        build_dashboard(args)
 
+
+def build_dashboard(args) -> None:
     client = OdooClient(profile="prod" if args.prod else "local")
     tz = ZoneInfo(client.user_tz)
     today = dt.datetime.now(tz).date()
@@ -293,6 +309,41 @@ def main() -> None:
         print_grid(name, g)
     if not args.dry_run:
         print("\nSheet:", write_sheet(args.title, grids))
+
+
+def _on_ac_power() -> bool:
+    try:
+        out = subprocess.run(["pmset", "-g", "batt"], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return True  # not a battery-powered Mac (or pmset missing): don't block the run
+    return "AC Power" in out or "Battery Power" not in out
+
+
+def _read_stamp() -> dt.datetime | None:
+    try:
+        return dt.datetime.fromisoformat(STAMP_FILE.read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def run_if_due(args) -> None:
+    """Catch-up guard for the scheduler: refresh once per evening, the next time the
+    laptop is awake and plugged in. Failure leaves the stamp unwritten, so a run that
+    fails (e.g. Wi-Fi not up yet on wake) is retried at the next poll."""
+    now = dt.datetime.now().astimezone()
+    stamp = f"[{now:%Y-%m-%d %H:%M}]"
+    if REQUIRE_AC and not _on_ac_power():
+        print(f"{stamp} skip: on battery (will run when next plugged in)")
+        return
+    last = _read_stamp()
+    if not wm.is_due(last, now, RUN_HOUR, RUN_MINUTE):
+        print(f"{stamp} skip: already refreshed since {RUN_HOUR:02d}:{RUN_MINUTE:02d} (last {last:%Y-%m-%d %H:%M})")
+        return
+    print(f"{stamp} due (last success {last}) — refreshing")
+    build_dashboard(args)
+    STAMP_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STAMP_FILE.write_text(now.isoformat())
+    print(f"{stamp} success recorded")
 
 
 if __name__ == "__main__":

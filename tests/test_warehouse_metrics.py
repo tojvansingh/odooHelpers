@@ -52,3 +52,32 @@ def test_local_date_converts_from_utc():
 
 def test_utc_str_is_local_midnight():
     assert wm.utc_str(WED, PT) == "2026-06-10 07:00:00"  # PDT = UTC-7
+
+
+def test_run_boundary_before_and_after_time():
+    morning = dt.datetime(2026, 6, 10, 9, 0)
+    evening = dt.datetime(2026, 6, 10, 18, 0)
+    assert wm.run_boundary(morning, 16, 30) == dt.datetime(2026, 6, 9, 16, 30)
+    assert wm.run_boundary(evening, 16, 30) == dt.datetime(2026, 6, 10, 16, 30)
+
+
+def test_is_due_first_run_when_no_stamp():
+    assert wm.is_due(None, dt.datetime(2026, 6, 10, 18, 0), 16, 30) is True
+
+
+def test_is_due_same_evening_after_time():
+    now = dt.datetime(2026, 6, 10, 16, 31)
+    assert wm.is_due(dt.datetime(2026, 6, 9, 16, 35), now, 16, 30) is True  # owed for today
+    assert wm.is_due(dt.datetime(2026, 6, 10, 16, 30, 5), now, 16, 30) is False  # already ran
+
+
+def test_is_due_morning_catch_up_after_missed_evening():
+    # Ran Mon 16:35; Tue 16:30 missed (asleep); now Wed 09:00 → most recent boundary Tue 16:30
+    now = dt.datetime(2026, 6, 10, 9, 0)  # Wed morning
+    assert wm.is_due(dt.datetime(2026, 6, 8, 16, 35), now, 16, 30) is True
+
+
+def test_is_due_morning_no_run_if_already_current():
+    # Ran yesterday evening at 16:35; now this morning, before today's boundary → not owed yet
+    now = dt.datetime(2026, 6, 10, 9, 0)
+    assert wm.is_due(dt.datetime(2026, 6, 9, 16, 35), now, 16, 30) is False

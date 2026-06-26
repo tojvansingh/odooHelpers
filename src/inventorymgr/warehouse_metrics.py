@@ -68,6 +68,23 @@ def week_start(today: dt.date) -> dt.date:
     return today - dt.timedelta(days=today.weekday())
 
 
+def run_boundary(now: dt.datetime, hour: int, minute: int) -> dt.datetime:
+    """The most recent scheduled instant: today's HH:MM if it has passed, else yesterday's.
+
+    Used for anacron-style catch-up: a refresh is owed once per HH:MM boundary, so a
+    run missed yesterday evening is still owed when the laptop wakes the next morning.
+    """
+    today_run = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    return today_run if now >= today_run else today_run - dt.timedelta(days=1)
+
+
+def is_due(last_success: dt.datetime | None, now: dt.datetime, hour: int, minute: int) -> bool:
+    """True when no successful run has happened since the last HH:MM boundary."""
+    if last_success is None:
+        return True
+    return last_success < run_boundary(now, hour, minute)
+
+
 def due_bucket(day: dt.date, today: dt.date) -> str:
     delta = (day - today).days
     if delta < 0:

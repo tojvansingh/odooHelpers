@@ -5,11 +5,15 @@ items ON THAT PO — the PO disambiguates whether it's a pillow, glass, dish tow
 
 Sheet columns (configurable): PO# (e.g. P60199), Design (vendor item name), Qty (received).
 
+Matching: tokens are graded (exact > prefix > typo-fuzzy) and IDF-weighted so a rare,
+distinctive token (VAIL) outweighs a common one (VALLEY/PILLOW). A match is only auto-filled
+when it's confident AND clearly ahead of the runner-up; otherwise the cell is left EMPTY and
+the top candidates go in a "Suggestions" column for the operator to choose.
+
 Modes:
-  annotate (default): for each row, fill three columns —
-      "Disambiguated Item Name" (best match; "?? ..." = low confidence; "NO MATCH" = none),
-      "On Order Qty", "Received Qty" (already-received on that PO line).
-    The operator corrects "Disambiguated Item Name" and re-runs to refresh the other two.
+  annotate (default): fills "Disambiguated Item Name" (confident only; else blank),
+    "On Order Qty", "Received Qty", "Suggestions". Operator-filled Disambiguated cells are
+    never overwritten. The operator fills/fixes Disambiguated and re-runs to refresh.
   --receive: set the matched quantities on each PO's open incoming receipt and validate it
     (auto-creating a backorder for the remainder). Gated: --prod for production; --dry-run preview.
 
@@ -21,6 +25,7 @@ Run:
 from __future__ import annotations
 
 import argparse
+import math
 import re
 from collections import defaultdict
 from difflib import SequenceMatcher
@@ -28,8 +33,10 @@ from difflib import SequenceMatcher
 from inventorymgr.sources.gsheets import GSheets
 from inventorymgr.sources.odoo_client import OdooClient
 
-DISAMBIG, ONORDER, RECEIVED = "Disambiguated Item Name", "On Order Qty", "Received Qty"
-LOW_CONFIDENCE = 0.45
+DISAMBIG, ONORDER, RECEIVED, SUGGEST = "Disambiguated Item Name", "On Order Qty", "Received Qty", "Suggestions"
+CONFIDENT = 0.62     # min score to auto-fill a match
+MARGIN = 0.08        # min lead over the runner-up to auto-fill (else ambiguous -> blank)
+FUZZY_TOK = 0.82     # token typo tolerance (LOUSIANA ~ LOUISIANA)
 
 
 def norm(s: str) -> str:
@@ -38,23 +45,43 @@ def norm(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
-def _tok_match(t: str, w: str) -> bool:
-    # equal / prefix / typo-tolerant (catches LOUSIANA~LOUISIANA, CAPRICON~CAPRICORN)
-    return w == t or w.startswith(t) or t.startswith(w) or SequenceMatcher(None, t, w).ratio() >= 0.8
+def _token_quality(t: str, ct: list[str], ct_set: set) -> float:
+    if t in ct_set:                                   # exact token
+        return 1.0
+    if any(w.startswith(t) for w in ct):              # candidate token EXTENDS vendor token (AMERICA -> AMERICA250)
+        return 0.55
+    best = max((SequenceMatcher(None, t, w).ratio() for w in ct), default=0.0)
+    return best if best >= FUZZY_TOK else best * 0.4  # weak fuzzy heavily discounted
 
 
-def match_score(vendor: str, cand: str) -> float:
-    v, c = norm(vendor), norm(cand)
-    if not v or not c:
-        return 0.0
-    vt, ct = v.split(), c.split()
-    covered = sum(1 for t in vt if any(_tok_match(t, w) for w in ct)) / len(vt)
-    return 0.65 * covered + 0.35 * SequenceMatcher(None, v, c).ratio()
+def best_match(name: str, candidates: list[str]) -> tuple[str | None, float, float, list[str]]:
+    """Return (best_display, score, margin_over_runner_up, top3_suggestions)."""
+    cand_norm = {dn: norm(dn) for dn in candidates}
+    n = max(1, len(candidates))
+    vt = norm(name).split()
+    if not vt:
+        return (None, 0.0, 0.0, [])
+    # IDF of each vendor token among the candidates (rare -> high weight)
+    idf = {}
+    for t in set(vt):
+        df = sum(1 for cn in cand_norm.values() if t in cn.split())
+        idf[t] = math.log((n + 1) / (df + 1)) + 1
 
+    def score(cn: str) -> float:
+        ct = cn.split()
+        ct_set = set(ct)
+        num = den = 0.0
+        for t in vt:
+            num += idf[t] * _token_quality(t, ct, ct_set)
+            den += idf[t]
+        return num / den if den else 0.0
 
-def best_match(name: str, candidates: list[str]) -> tuple[str | None, float]:
-    scored = sorted(((match_score(name, dn), dn) for dn in candidates), reverse=True)
-    return (scored[0][1], scored[0][0]) if scored else (None, 0.0)
+    scored = sorted(((score(cn), dn) for dn, cn in cand_norm.items()), reverse=True)
+    if not scored:
+        return (None, 0.0, 0.0, [])
+    top_score, top_dn = scored[0]
+    margin = top_score - (scored[1][0] if len(scored) > 1 else 0.0)
+    return (top_dn, top_score, margin, [dn for _, dn in scored[:3]])
 
 
 def fetch_po_items(c: OdooClient, po_names) -> dict:
@@ -74,23 +101,29 @@ def fetch_po_items(c: OdooClient, po_names) -> dict:
     return out
 
 
-def resolve(items: dict, vendor_name: str, disambig: str):
-    """Return (pid, display_name, ordered, received, score). items: {pid: {...}}."""
+def resolve(items: dict, vendor_name: str, existing: str):
+    """Return (pid, write_disambig, ordered, received, suggestions).
+
+    pid is None when unresolved. An operator-filled `existing` is honored and never blanked.
+    """
     if not items:
-        return (None, "NO MATCH", "", "", 0.0)
+        return (None, existing, "", "", "")
     by_name = {v["display_name"]: pid for pid, v in items.items()}
-    chosen = (disambig or "").strip()
-    # operator confirmed an exact PO item name -> lock it in
-    if chosen in by_name:
-        pid = by_name[chosen]
-        return (pid, chosen, items[pid]["ordered"], items[pid]["received"], 1.0)
-    target = chosen if chosen and chosen.upper() != "NO MATCH" else vendor_name
-    dn, score = best_match(target, list(by_name))
-    if dn is None or score < 0.2:
-        return (None, "NO MATCH", "", "", score)
-    pid = by_name[dn]
-    label = dn if score >= LOW_CONFIDENCE else f"?? {dn}"
-    return (pid, label, items[pid]["ordered"], items[pid]["received"], score)
+    existing = (existing or "").strip()
+    if existing in by_name:                                   # operator confirmed an exact PO item
+        pid = by_name[existing]
+        return (pid, existing, items[pid]["ordered"], items[pid]["received"], "")
+    if existing:                                              # operator typed something else -> resolve, keep their text
+        dn, sc, mg, sugg = best_match(existing, list(by_name))
+        if dn and sc >= CONFIDENT:
+            pid = by_name[dn]
+            return (pid, existing, items[pid]["ordered"], items[pid]["received"], "")
+        return (None, existing, "", "", " | ".join(sugg))     # unresolved; leave their text + suggestions
+    dn, sc, mg, sugg = best_match(vendor_name, list(by_name))  # first pass on the vendor name
+    if dn and sc >= CONFIDENT and mg >= MARGIN:
+        pid = by_name[dn]
+        return (pid, dn, items[pid]["ordered"], items[pid]["received"], "")
+    return (None, "", "", "", " | ".join(sugg))               # uncertain -> blank + suggestions
 
 
 def main() -> None:
@@ -115,54 +148,57 @@ def main() -> None:
     ws = sh.worksheet(args.tab) if args.tab else sh.worksheets()[0]
     vals = ws.get_all_values()
     header = vals[0]
-    for col in (args.po_col, args.item_col, args.qty_col):
-        if col not in header:
-            raise SystemExit(f"Column {col!r} not in sheet header {header}")
+    for c2 in (args.po_col, args.item_col, args.qty_col):
+        if c2 not in header:
+            raise SystemExit(f"Column {c2!r} not in sheet header {header}")
     pi, ii, qi = header.index(args.po_col), header.index(args.item_col), header.index(args.qty_col)
     col = {}
-    for nm in (DISAMBIG, ONORDER, RECEIVED):
+    for nm in (DISAMBIG, ONORDER, RECEIVED, SUGGEST):
         if nm not in header:
             header.append(nm)
         col[nm] = header.index(nm)
     width = len(header)
 
-    data = [r for r in vals[1:] if r and len(r) > max(pi, ii) and (r[pi].strip() or r[ii].strip())]
-    po_items = fetch_po_items(c, {r[pi].strip() for r in data if r[pi].strip()})
+    po_items = fetch_po_items(c, {r[pi].strip() for r in vals[1:] if len(r) > pi and r[pi].strip()})
 
-    # resolve every row
     resolved = []  # (row, pid, qty)
-    low = nomatch = 0
+    blanks = unresolved = 0
     for r in vals[1:]:
         while len(r) < width:
             r.append("")
         po = r[pi].strip()
         if not po and not r[ii].strip():
             continue
-        pid, label, ordered, received, score = resolve(po_items.get(po, {}), r[ii], r[col[DISAMBIG]])
-        r[col[DISAMBIG]] = label
+        pid, disp, ordered, received, sugg = resolve(po_items.get(po, {}), r[ii], r[col[DISAMBIG]])
+        r[col[DISAMBIG]] = disp
         r[col[ONORDER]] = ordered
         r[col[RECEIVED]] = received
+        r[col[SUGGEST]] = sugg
         try:
             qty = float(r[qi] or 0)
         except ValueError:
             qty = 0
         resolved.append((r, pid, qty))
         if pid is None:
-            nomatch += 1
-        elif score < LOW_CONFIDENCE:
-            low += 1
+            unresolved += 1
+            if not (r[col[DISAMBIG]]).strip():
+                blanks += 1
 
     if args.receive:
-        receive(c, resolved, pi, po_items, args.dry_run)
+        skipped = [r[ii] for r, pid, q in resolved if pid is None and q > 0]
+        if skipped:
+            print(f"  skipping {len(skipped)} unresolved rows (blank Disambiguated): {skipped[:6]}")
+        receive(c, resolved, pi, args.dry_run)
         return
 
     ws.update(values=[header] + vals[1:], range_name="A1", value_input_option="USER_ENTERED")
-    print(f"annotated {len(resolved)} rows | low-confidence (??): {low} | no-match: {nomatch}")
-    print("Fix any 'Disambiguated Item Name' cells and re-run; then add --receive to post the receipts.")
+    print(f"annotated {len(resolved)} rows | auto-filled: {len(resolved)-unresolved} | "
+          f"left blank for review: {blanks}")
+    print("Pick from 'Suggestions' into 'Disambiguated Item Name' for blank rows, re-run, then add --receive.")
 
 
-def receive(c: OdooClient, resolved, pi: int, po_items: dict, dry: bool) -> None:
-    by_po: dict = defaultdict(dict)  # po -> pid -> qty
+def receive(c: OdooClient, resolved, pi: int, dry: bool) -> None:
+    by_po: dict = defaultdict(dict)
     for r, pid, qty in resolved:
         if pid and qty > 0:
             by_po[r[pi].strip()][pid] = by_po[r[pi].strip()].get(pid, 0) + qty

@@ -92,13 +92,23 @@ def main() -> None:
         a = min(a, m["product_uom_qty"])
         splits.append((m["id"], m["product_id"][1], a, m["product_uom_qty"] - a))
 
-    print(f"{args.po} receipt {pick['name']}: splitting {len(splits)} of {len(moves)} lines")
+    # Name the AIR receipt to follow the PO's receipt convention (next "-N" suffix);
+    # otherwise stock.picking.create falls back to the raw picking-type sequence (PETA/IN/000xx).
+    base = re.sub(r"-\d+$", "", pick["name"])
+    suffixes = []
+    for p in c.search_read("stock.picking", [["id", "in", po["picking_ids"]]], ["name"]):
+        mm = re.fullmatch(re.escape(base) + r"-(\d+)", p["name"])
+        suffixes.append(int(mm.group(1)) if mm else (1 if p["name"] == base else 0))
+    air_name = f"{base}-{(max(suffixes) if suffixes else 1) + 1}"
+
+    print(f"{args.po} receipt {pick['name']}: splitting {len(splits)} of {len(moves)} lines -> AIR receipt {air_name}")
     for _, name, a, sea in splits:
         print(f"  {name[:34]:34} AIR {a:.0f} / SEA {sea:.0f}")
     if args.dry_run or not splits:
         return
 
     air_pick = c.execute_kw("stock.picking", "create", [{
+        "name": air_name,
         "picking_type_id": pick["picking_type_id"][0],
         "location_id": pick["location_id"][0],
         "location_dest_id": pick["location_dest_id"][0],

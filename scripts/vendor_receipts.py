@@ -11,11 +11,12 @@ Run:
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 
 from inventorymgr.sources.gsheets import GSheets
 from inventorymgr.sources.odoo_client import OdooClient
 
-HEADERS = ["PO#", "Receipt", "Scheduled Date", "Item", "Qty on PO", "Received", "Remaining"]
+HEADERS = ["PO#", "Receipt(s)", "Scheduled Date", "Item", "Qty on PO", "Received", "Remaining"]
 
 
 def main() -> None:
@@ -44,23 +45,33 @@ def main() -> None:
 
     lines = {x["id"]: x for x in c.search_read(
         "purchase.order.line", [["id", "in", list({m["purchase_line_id"][0] for m in moves if m.get("purchase_line_id")})]],
-        ["order_id", "product_qty", "qty_received"])}
+        ["order_id", "product_id", "product_qty", "qty_received"])}
     picks = {x["id"]: x for x in c.search_read(
         "stock.picking", [["id", "in", list({m["picking_id"][0] for m in moves})]],
         ["name", "scheduled_date"])}
 
-    rows = []
+    # Aggregate per PO line (one product on a PO) so split receipts don't double-count.
+    agg: dict = defaultdict(lambda: {"receipts": set(), "dates": []})
     for m in moves:
-        ln = lines.get(m["purchase_line_id"][0]) if m.get("purchase_line_id") else None
-        if not ln:
+        if not m.get("purchase_line_id"):
             continue
         pk = picks.get(m["picking_id"][0], {})
+        a = agg[m["purchase_line_id"][0]]
+        if pk.get("name"):
+            a["receipts"].add(pk["name"])
+        if pk.get("scheduled_date"):
+            a["dates"].append(pk["scheduled_date"][:10])
+    rows = []
+    for lid, info in agg.items():
+        ln = lines.get(lid)
+        if not ln:
+            continue
         ordered, recv = ln["product_qty"] or 0, ln["qty_received"] or 0
         rows.append([
             ln["order_id"][1] if ln.get("order_id") else "",
-            pk.get("name", ""),
-            (pk.get("scheduled_date") or "")[:10],
-            m["product_id"][1],
+            ", ".join(sorted(info["receipts"])),
+            min(info["dates"]) if info["dates"] else "",
+            ln["product_id"][1] if ln.get("product_id") else "",
             ordered, recv, ordered - recv,
         ])
     rows.sort(key=lambda r: (r[2], r[0], r[3]))

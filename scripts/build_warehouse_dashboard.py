@@ -25,6 +25,7 @@ import datetime as dt
 import pathlib
 import subprocess
 import sys
+from collections import defaultdict
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1] / "src"))
@@ -209,6 +210,8 @@ def build_shipping_tab(ships, summary, days, today, month_label, wd_elapsed, tz_
         ("   late — waiting on manufacturing", "late_mfg", "data"),
         ("   late — waiting on inventory (not mfg)", "late_inv", "data"),
         ("   late — ready to ship", "late_ready", "data"),
+        ("        ready — no review needed", "late_ready_clean", "data"),
+        ("        ready — needs review", "late_ready_review", "data"),
     ):
         e = summary[key]
         r = g.add([label, e["orders"], round(e["total"]), round(e["unshipped"])], kind=kind)
@@ -225,22 +228,24 @@ def build_shipping_tab(ships, summary, days, today, month_label, wd_elapsed, tz_
         "Waiting on manufacturing = a short item on the delivery is tied to an open MO,"
         " or its product has an open MO or a BOM. Otherwise: waiting on inventory; ready = stock"
         " on hand but not yet shipped. See the 'SO Detail' tab for the individual orders.",
+        "Ready to ship splits into 'no review needed' (should just ship) vs 'needs review' (the delivery"
+        " is flagged to-review — e.g. Routing Guide, Cancel Date, Invoice Due; reasons in SO Detail).",
         f"Late-mfg orders also appear under 'Due to ship, waiting on manufacturing'. Dates in {tz_name}.",
     ):
         g.add([note], kind="note")
     return g
 
 
-MO_DETAIL_COLS = ["MO", "Product", "Class", "Qty to make", "Start", "Days late", "Components", "Blocking orders"]
-MO_DETAIL_WIDTHS = [115, 270, 110, 90, 90, 80, 115, 230]
-SO_DETAIL_COLS = ["Order", "Customer", "Scheduled", "Days late", "$ Order Total", "$ Unshipped", "Waiting on"]
-SO_DETAIL_WIDTHS = [95, 230, 95, 80, 105, 105, 320]
+MO_DETAIL_COLS = ["MO", "Product", "Qty to make", "Due bucket", "Start", "Days late", "Components", "Blocking orders"]
+MO_DETAIL_WIDTHS = [115, 255, 90, 100, 90, 80, 115, 210]
+SO_DETAIL_WIDTHS = [95, 225, 95, 80, 105, 105, 330]
 
 
 def build_mo_detail_tab(mo_details, today, tz_name) -> TabGrid:
     g = TabGrid()
     g.col_widths = MO_DETAIL_WIDTHS
-    g.add([f"MO DETAIL — open manufacturing orders behind the backlog, refreshed {dt.datetime.now():%Y-%m-%d %H:%M}"],
+    bi = {b: i for i, b in enumerate(wm.DUE_BUCKETS)}
+    g.add([f"MO DETAIL — open manufacturing orders by class, refreshed {dt.datetime.now():%Y-%m-%d %H:%M}"],
           kind="title")
     for sub, label in ((False, "In-house MOs"), (True, "Subcontracted MOs")):
         items = [m for m in mo_details if m["subcontract"] == sub]
@@ -250,26 +255,28 @@ def build_mo_detail_tab(mo_details, today, tz_name) -> TabGrid:
         if not items:
             g.add(["(none)"], kind="note")
             continue
-        for bucket in wm.DUE_BUCKETS:
-            brows = sorted([m for m in items if m["bucket"] == bucket], key=lambda m: -m["qty"])
-            if not brows:
-                continue
-            units = int(round(sum(m["qty"] for m in brows)))
-            g.add([f"{bucket} — {len(brows)} MOs, {units:,} units"], kind="subsection")
+        classes = sorted({m["klass"] for m in items},
+                         key=lambda c: -sum(m["qty"] for m in items if m["klass"] == c))
+        for cls in classes:
+            crows = sorted([m for m in items if m["klass"] == cls], key=lambda m: (bi[m["bucket"]], -m["qty"]))
+            units = int(round(sum(m["qty"] for m in crows)))
+            pastdue = int(round(sum(m["qty"] for m in crows if m["days_late"] > 0)))
+            head = f"{cls} — {len(crows)} MOs, {units:,} units" + (f"  ({pastdue:,} past due)" if pastdue else "")
+            g.add([head], kind="subsection")
             hdr = g.add(MO_DETAIL_COLS, kind="header")
-            for m in brows:
+            for m in crows:
                 blocking = ", ".join(m["blocking_sos"])
                 if m["blocking_sos"] and m["blocking_late"]:
                     blocking = "⚠ " + blocking
-                g.add([m["name"], m["product"], m["klass"], _num(m["qty"]),
-                       f"{m['start']:%Y-%m-%d}", m["days_late"] or "", m["components"], blocking])
-            g.fmt(f"D{hdr + 1}:D{len(g.rows)}", INT_FMT)
-            if bucket == wm.DUE_BUCKETS[0]:
-                g.fmt(f"F{hdr + 1}:F{len(g.rows)}", {"textFormat": {"foregroundColor": {"red": 0.7}}})
+                g.add([m["name"], m["product"], _num(m["qty"]), m["bucket"],
+                       f"{m['start']:%Y-%m-%d}", m["days_late"] if m["days_late"] > 0 else "",
+                       m["components"], blocking])
+            g.fmt(f"C{hdr + 1}:C{len(g.rows)}", INT_FMT)
+            g.pastdue_ranges.append(f"F{hdr + 1}:F{len(g.rows)}")  # red when days-late > 0
     g.add()
     for note in (
-        "One row per open MO with units still to make. Class/bucket match the Manufacturing tab"
-        " (bucket = scheduled start vs today; Past due = start before today).",
+        "Grouped by product Class, then bucket within each class (Past due first). Bucket ="
+        " scheduled start vs today; Past-due Days-late cells are highlighted.",
         "Components = Odoo's component-availability status for the MO (e.g. Available / Not Available).",
         "Blocking orders = customer sale orders waiting on this MO (via the make-to-order link);"
         " ⚠ marks that at least one of those deliveries is already past its scheduled date.",
@@ -281,29 +288,74 @@ def build_mo_detail_tab(mo_details, today, tz_name) -> TabGrid:
 def build_so_detail_tab(exc, today, tz_name) -> TabGrid:
     g = TabGrid()
     g.col_widths = SO_DETAIL_WIDTHS
-    g.add([f"SO DETAIL — open customer deliveries behind the Shipping summary, refreshed {dt.datetime.now():%Y-%m-%d %H:%M}"],
+    g.add([f"SO DETAIL — open customer deliveries by class, refreshed {dt.datetime.now():%Y-%m-%d %H:%M}"],
           kind="title")
-    for _key, title, rows in wm.delivery_detail_sections(exc):
-        total = int(round(sum(r["total"] for r in rows)))
+    orders = exc["orders"]
+    late = [r for r in orders if r["late"]]
+    ready = [r for r in late if not r["mfg"] and not r["inv"]]
+
+    def _sched(r):
+        return f"{r['scheduled']:%Y-%m-%d}" if r["scheduled"] else ""
+
+    def _late(r):
+        return r["days_late"] if r["days_late"] > 0 else ""
+
+    def class_section(title, rows, class_field):
         g.add()
+        distinct = len({r["name"] for r in rows})
+        total = int(round(sum(r["total"] for r in rows)))
+        g.add([f"{title} — {distinct} orders, ${total:,} order value"], kind="section")
+        if not rows:
+            g.add(["(none)"], kind="note")
+            return
+        by_cls = defaultdict(list)
+        for r in rows:
+            for cls in (r[class_field] or {"(no class)": []}):
+                by_cls[cls].append(r)
+        for cls in sorted(by_cls, key=lambda c: -sum(x["unshipped"] for x in by_cls[c])):
+            crows = sorted(by_cls[cls], key=lambda r: -r["days_late"])
+            g.add([f"{cls} — {len(crows)} orders"], kind="subsection")
+            hdr = g.add(["Order", "Customer", "Scheduled", "Days late", "$ Order Total",
+                         "$ Unshipped", f"Waiting on ({cls})"], kind="header")
+            for r in crows:
+                items = r[class_field].get(cls, [])
+                waiting = ", ".join(items[:5]) + (" …" if len(items) > 5 else "")
+                g.add([r["name"], r["partner"], _sched(r), _late(r),
+                       round(r["total"]), round(r["unshipped"]), waiting])
+            g.fmt(f"D{hdr + 1}:D{len(g.rows)}", INT_FMT)
+            g.fmt(f"E{hdr + 1}:F{len(g.rows)}", USD)
+
+    def flat_section(title, rows, review=False):
+        g.add()
+        total = int(round(sum(r["total"] for r in rows)))
         g.add([f"{title} — {len(rows)} orders, ${total:,} order value"], kind="section")
         if not rows:
             g.add(["(none)"], kind="note")
-            continue
-        hdr = g.add(SO_DETAIL_COLS, kind="header")
-        for r in rows:
-            sched = f"{r['scheduled']:%Y-%m-%d}" if r["scheduled"] else ""
-            waiting = ", ".join(r["waiting"][:5]) + (" …" if len(r["waiting"]) > 5 else "")
-            g.add([r["name"], r["partner"], sched, r["days_late"] if r["days_late"] > 0 else "",
-                   round(r["total"]), round(r["unshipped"]), waiting])
+            return
+        cols = ["Order", "Customer", "Scheduled", "Days late", "$ Order Total", "$ Unshipped"]
+        hdr = g.add(cols + (["Review reason"] if review else []), kind="header")
+        for r in sorted(rows, key=lambda r: -r["days_late"]):
+            base = [r["name"], r["partner"], _sched(r), _late(r), round(r["total"]), round(r["unshipped"])]
+            g.add(base + ([", ".join(r["reasons"])] if review else []))
         g.fmt(f"D{hdr + 1}:D{len(g.rows)}", INT_FMT)
         g.fmt(f"E{hdr + 1}:F{len(g.rows)}", USD)
+
+    class_section("Due to ship, waiting on manufacturing", [r for r in orders if r["mfg"]], "mfg_classes")
+    class_section("Late — waiting on manufacturing", [r for r in late if r["mfg"]], "mfg_classes")
+    class_section("Late — waiting on inventory (not manufacturing)",
+                  [r for r in late if not r["mfg"] and r["inv"]], "inv_classes")
+    flat_section("Late — ready to ship, no review needed", [r for r in ready if not r["review"]])
+    flat_section("Late — ready to ship, needs review", [r for r in ready if r["review"]], review=True)
+
     g.add()
     for note in (
-        "Sections mirror the Shipping summary's open-deliveries rows. Days late = today −"
-        " the order's earliest open-delivery scheduled date.",
-        "Waiting on = the specific items on the delivery that aren't yet available (first 5 shown).",
-        "Late-mfg orders also appear under 'Due to ship, waiting on manufacturing', matching the summary.",
+        "Sections mirror the Shipping summary. The three waiting sections are grouped by the product"
+        " Class of the items being waited on; an order needing several classes appears under each, so"
+        " a section's class subtotals can exceed its distinct order count (shown in the section header).",
+        "Ready-to-ship orders have stock available but aren't shipped; split into no review needed vs"
+        " needs review (the delivery is flagged 'to review' — reasons shown in the last column).",
+        "Days late = today − the order's earliest open-delivery scheduled date. 'Waiting on' lists that"
+        " class's not-yet-available items (first 5). Late-mfg orders also appear under 'Due to ship'.",
     ):
         g.add([note], kind="note")
     return g

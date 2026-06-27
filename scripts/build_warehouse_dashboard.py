@@ -3,12 +3,19 @@
 Run: cd odooHelpers && uv run python scripts/build_warehouse_dashboard.py [--prod] [--dry-run]
 
 Tabs:
-  Manufacturing — units finished per class (last 5 weekdays, this week, avg/weekday
-                  this month) and open-MO backlog bucketed by scheduled start,
-                  split in-house vs subcontracted.
-  Shipping      — retail vs wholesale orders shipped (# and $) per day, plus open
-                  deliveries: due-but-waiting-on-manufacturing, late and its split
-                  (waiting on manufacturing / waiting on inventory / ready).
+  Manufacturing   — units finished per class (last 5 weekdays, this week, avg/weekday
+                    this month) and open-MO backlog bucketed by scheduled start,
+                    split in-house vs subcontracted.
+  MO Detail       — the individual open MOs behind each backlog bucket, with the
+                    customer orders each one blocks.
+  Shipping        — retail vs wholesale orders shipped (# and $) per day, plus open
+                    deliveries: due-but-waiting-on-manufacturing, late and its split
+                    (waiting on manufacturing / waiting on inventory / ready).
+  SO Detail       — the individual open customer orders behind each Shipping bucket.
+  Production Plan — editable per-class daily capacity, a hotspot view (work-days to
+                    clear at that capacity), and a prioritized list of MOs to make
+                    tomorrow with a ✓ cut-line that fits within capacity. Capacity
+                    edits are preserved across refreshes.
 """
 
 from __future__ import annotations
@@ -48,7 +55,10 @@ HEADER_BG = {"red": 0.937, "green": 0.937, "blue": 0.937}
 TOTAL_BG = {"red": 0.965, "green": 0.965, "blue": 0.965}
 SUMMARY_BG = {"red": 0.929, "green": 0.957, "blue": 0.988}   # This Week / Avg columns
 PASTDUE_BG = {"red": 0.957, "green": 0.80, "blue": 0.80}
+PASTDUE_BG_LIGHT = {"red": 0.984, "green": 0.93, "blue": 0.93}
 GRAY_TEXT = {"red": 0.45, "green": 0.45, "blue": 0.45}
+GREEN_TEXT = {"red": 0.18, "green": 0.49, "blue": 0.20}
+EDIT_BG = {"red": 1.0, "green": 0.976, "blue": 0.792}      # editable capacity cells (soft yellow)
 
 KIND_FORMATS = {
     "title": {"textFormat": {"bold": True, "fontSize": 12}},
@@ -299,6 +309,137 @@ def build_so_detail_tab(exc, today, tz_name) -> TabGrid:
     return g
 
 
+PLAN_TAB = "Production Plan"
+PLAN_COLS = ["MO", "Product", "Qty", "Priority", "Components", "Blocking orders", "Cum. units", "Make tmrw?"]
+PLAN_WIDTHS = [115, 250, 70, 110, 115, 200, 90, 95]
+
+
+def _priority(m: dict) -> tuple:
+    """Sort key (lower = make sooner): late-order blockers, then any customer order,
+    then most-overdue, then soonest bucket, then biggest qty."""
+    return (not m["blocking_late"], not bool(m["blocking_sos"]),
+            -m["days_late"], wm.DUE_BUCKETS.index(m["bucket"]), -m["qty"])
+
+
+def _priority_label(m: dict) -> str:
+    if m["blocking_late"]:
+        return "⚠ Late order"
+    if m["blocking_sos"]:
+        return "Customer order"
+    if m["days_late"] > 0:
+        return "Past due"
+    return "Stock build"
+
+
+def build_production_plan_tab(mo_details, backlog, output, today, wd_elapsed, cap_overrides) -> TabGrid:
+    g = TabGrid()
+    g.col_widths = PLAN_WIDTHS
+    month_start = today.replace(day=1)
+    inhouse = [m for m in mo_details if not m["subcontract"]]
+    classes = sorted({m["klass"] for m in inhouse},
+                     key=lambda c: -sum(m["qty"] for m in inhouse if m["klass"] == c))
+
+    def seed(c):
+        # Manager's saved edit wins; else a placeholder = best single-day output observed
+        # (demonstrated capability beats the average, which low recent volume drags down).
+        if c in cap_overrides:
+            return cap_overrides[c]
+        peak = max(output.get(c, {}).values(), default=0)
+        return max(int(round(peak)), 1)
+
+    g.add([f"PRODUCTION PLAN — what to make tomorrow, refreshed {dt.datetime.now():%Y-%m-%d %H:%M}"], kind="title")
+
+    # 1) Editable daily capacity (preserved across refreshes).
+    g.add()
+    g.add(["Daily capacity — units/day per class  (EDIT these; tweaks are kept on refresh)"], kind="section")
+    g.add(["Class", "Units/Day"], kind="header")
+    cap_cell = {}
+    cap_first = len(g.rows) + 1
+    for c in classes:
+        r = g.add([c, seed(c)])
+        cap_cell[c] = f"$B${r}"
+    if classes:
+        g.fmt(f"B{cap_first}:B{len(g.rows)}", {"backgroundColor": EDIT_BG, **INT_FMT})
+
+    # 2) Hotspots: live work-days-to-clear from the editable capacity above.
+    g.add()
+    g.add(["Class load & hotspots — work-days to clear the actionable backlog at the capacity above"],
+          kind="section")
+    hdr = g.add(["Class", "Past-due", "Due ≤2 wks", "On late orders", "Capacity/day",
+                 "Work-days to clear", "Status"], kind="header")
+    for c in classes:
+        past = int(round(backlog.get(c, {}).get(wm.DUE_BUCKETS[0], 0)))
+        soon = int(round(backlog.get(c, {}).get(wm.DUE_BUCKETS[1], 0)))
+        on_late = int(round(sum(m["qty"] for m in inhouse if m["klass"] == c and m["blocking_late"])))
+        r = g.add([c, past, soon, on_late, f"={cap_cell[c]}",
+                   f"=IFERROR(ROUND((B{len(g.rows)+1}+C{len(g.rows)+1})/E{len(g.rows)+1},1),0)",
+                   f'=IF(F{len(g.rows)+1}>5,"🔴 HOTSPOT",IF(F{len(g.rows)+1}>2,"🟡 Watch","🟢 OK"))'])
+    g.fmt(f"B{hdr+1}:E{len(g.rows)}", INT_FMT)
+    g.fmt(f"B{hdr+1}:B{len(g.rows)}", {"backgroundColor": PASTDUE_BG_LIGHT})
+
+    # 3) Prioritized pick list per class; ✓ marks MOs that fit within the day's capacity.
+    g.add()
+    g.add(["Tomorrow's suggested MOs — prioritized; ✓ = fits within that class's daily capacity"],
+          kind="section")
+    for c in classes:
+        rows = sorted([m for m in inhouse if m["klass"] == c], key=_priority)
+        pending = int(round(sum(m["qty"] for m in rows)))
+        g.add([f"{c} — {len(rows)} MOs, {pending:,} units pending  (capacity {cap_cell[c].replace('$','')})"],
+              kind="subsection")
+        hdr = g.add(PLAN_COLS, kind="header")
+        first = len(g.rows) + 1
+        for m in rows:
+            rr = len(g.rows) + 1
+            blocking = ", ".join(m["blocking_sos"][:3]) + (" …" if len(m["blocking_sos"]) > 3 else "")
+            g.add([m["name"], m["product"], _num(m["qty"]), _priority_label(m), m["components"],
+                   blocking, f"=SUM(C{first}:C{rr})", f'=IF(G{rr}<={cap_cell[c]},"✓","")'])
+        g.fmt(f"C{first}:C{len(g.rows)}", INT_FMT)
+        g.fmt(f"G{first}:G{len(g.rows)}", INT_FMT)
+        g.fmt(f"H{first}:H{len(g.rows)}", {"horizontalAlignment": "CENTER",
+                                           "textFormat": {"bold": True, "foregroundColor": GREEN_TEXT}})
+
+    g.add()
+    for note in (
+        "Capacity cells are yours to edit — the hotspot work-days and the ✓ cut-line below recompute live,"
+        " and your edits are read back and kept each nightly refresh.",
+        "Priority order: ⚠ Late order (MO blocks a past-due customer delivery) → Customer order (blocks an"
+        " open order) → Past due (scheduled start passed) → Stock build. Within a tier, most-overdue first.",
+        "✓ = this MO fits within the class's daily capacity (cumulative units ≤ capacity). Work-days to clear"
+        " = (past-due + due-within-2-weeks units) ÷ capacity/day; 🔴 >5 days, 🟡 >2 days.",
+        "Subcontracted MOs are excluded (made by outside vendors). Components = Odoo readiness; 'Not Available'"
+        " MOs need parts before they can run.",
+    ):
+        g.add([note], kind="note")
+    return g
+
+
+def read_capacity_overrides(sh) -> dict[str, float]:
+    """Read the manager's edited Units/Day values from the existing Production Plan tab,
+    so a refresh preserves them instead of resetting to the seeded defaults."""
+    try:
+        ws = sh.worksheet(PLAN_TAB)
+    except gspread.WorksheetNotFound:
+        return {}
+    vals = ws.get_all_values()
+    out: dict[str, float] = {}
+    in_cap = False
+    for row in vals:
+        head = (row[0] if row else "").strip()
+        if head.startswith("Daily capacity"):
+            in_cap = True
+            continue
+        if in_cap:
+            if head in ("", "Class"):
+                if head == "":  # blank row ends the capacity table
+                    break
+                continue
+            try:
+                out[head] = float(str(row[1]).replace(",", ""))
+            except (IndexError, ValueError):
+                pass
+    return out
+
+
 def print_grid(name: str, g: TabGrid) -> None:
     print(f"\n=== {name} ===")
     widths = {}
@@ -370,8 +511,7 @@ def write_tab(sh, name: str, g: TabGrid) -> None:
     sh.batch_update({"requests": reqs})
 
 
-def write_sheet(title: str, grids: dict[str, TabGrid]) -> str:
-    sh = GSheets().open_or_create(title)
+def write_sheet(sh, grids: dict[str, TabGrid]) -> str:
     for name, g in grids.items():
         write_tab(sh, name, g)
     for w in sh.worksheets():
@@ -416,16 +556,21 @@ def build_dashboard(args) -> None:
     blocking = wm.fetch_mo_blocking_map(client, tz, ptype_ids, today)
     mo_details = wm.fetch_mo_details(client, tz, today, blocking)
 
+    # Open the sheet first so we can preserve the manager's edited capacity values.
+    sh = None if args.dry_run else GSheets().open_or_create(args.title)
+    cap_overrides = read_capacity_overrides(sh) if sh else {}
+
     grids = {
         "Manufacturing": build_manufacturing_tab(output, backlog, subcon, days, today, month_label, wd_elapsed, str(tz)),
         "MO Detail": build_mo_detail_tab(mo_details, today, str(tz)),
         "Shipping": build_shipping_tab(ships, exc["summary"], days, today, month_label, wd_elapsed, str(tz)),
         "SO Detail": build_so_detail_tab(exc, today, str(tz)),
+        "Production Plan": build_production_plan_tab(mo_details, backlog, output, today, wd_elapsed, cap_overrides),
     }
     for name, g in grids.items():
         print_grid(name, g)
-    if not args.dry_run:
-        print("\nSheet:", write_sheet(args.title, grids))
+    if sh is not None:
+        print("\nSheet:", write_sheet(sh, grids))
 
 
 def _on_ac_power() -> bool:

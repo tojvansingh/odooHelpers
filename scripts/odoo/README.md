@@ -19,7 +19,7 @@ uv run python scripts/odoo/<script>.py [args] [--prod]
 
 | Script | What it does | Example |
 |---|---|---|
-| `build_plan_sheet.py` | Customer-aware order plan → Google Sheet. Collection can be set per `--class` as `Class:Collection` — comma-separate for multiple (`Pillows:Geography,Astrology`) and/or prefix `<>` to exclude (`Pillows:<>Holiday`); `--collection` is the default for classes lacking their own. Also `--vendor`/`--arrive` | `... build_plan_sheet.py --prod --class "Pillows:Geography,Astrology" --class "Dish Towels:<>Holiday"` |
+| `build_plan_sheet.py` | Customer-aware order plan → Google Sheet. Collection can be set per `--class` as `Class:Collection` — comma-separate for multiple (`Pillows:Geography,Astrology`) and/or prefix `<>` to exclude (`Pillows:<>Holiday`); `--collection` is the default for classes lacking their own. Includes a 3M/6M sales-vs-last-year trend block (big % swings highlighted). Also `--vendor`/`--arrive`. Run `-h` for full column docs | `... build_plan_sheet.py --prod --class "Pillows:Geography,Astrology" --class "Dish Towels:<>Holiday"` |
 | `build_air_sheet.py` | AIR-vs-SEA expedite analysis for delayed POs → Google Sheet | `... build_air_sheet.py --prod --po P60165 --po P60167` |
 | `create_pos.py` | Draft POs from a plan sheet's Order Qty (final), grouped by vendor (local; `--prod` for production) | `... create_pos.py --sheet <KEY> --tab "Dish Towels" --vendor "Orchid Overseas" --date-planned 2026-11-15 --prod` |
 | `split_receipt.py` | Split a PO receipt into AIR + SEA receipts with separate dates (**LOCAL** only) | `... split_receipt.py --po P60165 --air "001D:100" --air-date 2026-08-15 --sea-date 2026-11-15` |

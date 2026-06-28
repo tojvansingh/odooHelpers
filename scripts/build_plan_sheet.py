@@ -36,6 +36,31 @@ def months_between(a: datetime.date, b: datetime.date) -> int:
     return (b.year - a.year) * 12 + (b.month - a.month)
 
 
+def trailing_windows(sales: dict, pids, today: datetime.date) -> dict:
+    """Per product, sum units sold over the last 3 and last 6 COMPLETED months (this year)
+    and over the same calendar months one year earlier.
+
+    Returns {pid: (sales_3m, sales_3m_last_yr, sales_6m, sales_6m_last_yr)}.
+    The current (partial) month is excluded so the comparison is like-for-like.
+    """
+    def months_back(k: int) -> list[tuple[int, int]]:
+        out, yy, mm = [], today.year, today.month
+        for _ in range(k):                       # walk back from the previous (last full) month
+            mm -= 1
+            if mm == 0:
+                mm, yy = 12, yy - 1
+            out.append((yy, mm))
+        return out
+
+    m3, m6 = months_back(3), months_back(6)
+
+    def s(pid: int, months, yr_off: int) -> float:
+        d = sales.get(pid, {})
+        return sum((d.get(f"{y - yr_off:04d}-{mo:02d}", 0) or 0) for (y, mo) in months)
+
+    return {pid: (s(pid, m3, 0), s(pid, m3, 1), s(pid, m6, 0), s(pid, m6, 1)) for pid in pids}
+
+
 def parse_class_spec(spec: str, default_collection: str | None) -> tuple[str, str]:
     """'Pillows:Geography' -> ('Pillows','Geography'); 'Pillows:<>Geography' -> ('Pillows','<>Geography');
     'Pillows' -> ('Pillows', default_collection)."""
@@ -69,8 +94,53 @@ def class_label(cls: str, negate: bool, names: list[str]) -> str:
     return f"{cls} (not {joined})" if negate else f"{cls} ({joined})"
 
 
+HELP_DESCRIPTION = """\
+Build a customer-aware inventory order plan from Odoo and write it to a review Google Sheet.
+
+For each Class (and optional Collection) it pulls on-hand, open sales orders, ready
+receipts and last-year sales from Odoo, projects inventory forward month by month, and
+recommends an order quantity (rounded up to the MOQ). One tab per Class; the named sheet
+is reused/overwritten on each run, so re-run any time to refresh the numbers.
+"""
+
+HELP_EPILOG = """\
+examples:
+  # one class, all collections, against production
+  ... build_plan_sheet.py --prod --class "Dish Towels"
+
+  # per-class collections: a list for one class, an exclusion for another
+  ... build_plan_sheet.py --prod --class "Pillows:Geography,Astrology" --class "Dish Towels:<>Holiday"
+
+  # size the horizon to a target arrival date and filter to one vendor
+  ... build_plan_sheet.py --prod --class "Pillows" --vendor JKM --arrive 2026-11-15
+
+using the generated sheet (one tab per class):
+  Planning columns (A-L):
+    On Hand / Outgoing / Incoming  current stock, open SO demand, receipts within the horizon
+    Proj End                       projected inventory at the end of the horizon (red if < 0)
+    MOQ                            minimum order / reorder multiple for the class+collection
+    Recommended                    shortfall rounded up to the MOQ (0 for 'custom' items)
+    Order Qty (final)              EDIT THIS — the qty that create_pos.py will order
+    Flags                          custom / oos / oos_no_incoming / no_history
+  Trend columns (M-R):
+    Sales 3M / 6M                  units sold over the last 3 / 6 COMPLETED months (this year)
+    3M LY / 6M LY                  units over the same calendar months one year earlier
+    3M Δ% / 6M Δ%                   % change vs last year; green if up >=30%, red if down >=30%
+                                   (blank when there was no prior-year baseline). Use these to
+                                   sanity-check the forecast and nudge Order Qty (final).
+  Monthly blocks (after R): Inv (live projection formula), Sales (last-yr forecast),
+    Booked-ret, Booked-new, Inc — one column per horizon month.
+
+workflow: run this -> review/edit 'Order Qty (final)' in the sheet ->
+  create_pos.py --sheet <KEY> --tab "<Class>" ... to draft the POs in Odoo.
+"""
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(
+        description=HELP_DESCRIPTION, epilog=HELP_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     ap.add_argument("--class", dest="classes", action="append",
                     help="Class name, optionally with a per-class collection as 'Class:Collection'. "
                          "Collection may be a comma-separated list ('Pillows:Geography,Astrology') and/or "
@@ -112,6 +182,7 @@ def main() -> None:
             raise SystemExit(f"No products for {cls} (collection={coll!r}, vendor={args.vendor})")
 
         sales = read_monthly_sales(client, pids)
+        windows = trailing_windows(sales, pids, today)  # 3M/6M sales vs same period last year
         # Incoming = Ready receipts only (stock.move state=assigned, incoming), dated by the
         # move's own scheduled date — excludes cancelled/done receipts and stale PO-line dates.
         remaining: dict[int, list] = {}
@@ -135,7 +206,7 @@ def main() -> None:
             bookings=bookings_by_pid, buyers_by_month=buyers, horizon_override=horizon_override,
         )
         label = class_label(cls, negate, coll_names)
-        blocks[label] = (months, results, params.moq_step)
+        blocks[label] = (months, results, params.moq_step, windows)
         print(f"{label}: {len(products)} products, {n}-mo horizon")
 
     title = args.title or "Inventory Plan — " + " + ".join(blocks)

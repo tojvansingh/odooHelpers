@@ -143,8 +143,23 @@ def main() -> None:
         print(f"  {pname}: {len(lines)} lines, total qty {sum(x[2] for x in lines):.0f}")
         if args.dry_run:
             continue
+        # Build each line Description like a manually-added line: product.display_name read
+        # WITH the vendor in context prepends the supplierinfo product code ([GN41619]…);
+        # products with no seller for this vendor fall back to their internal code.
+        pids_in = [pid for (pid, *_rest) in lines]
+        descr = {r["id"]: r for r in c.execute_kw(
+            "product.product", "read", [pids_in, ["display_name", "description_purchase"]],
+            {"context": {"partner_id": partner_id}})}
+
+        def line_name(pid, fallback, _d=descr):
+            r = _d.get(pid, {})
+            nm = r.get("display_name") or fallback
+            if r.get("description_purchase"):
+                nm += "\n" + r["description_purchase"]
+            return nm
+
         order_lines = [
-            (0, 0, {"product_id": pid, "name": name, "product_qty": qty,
+            (0, 0, {"product_id": pid, "name": line_name(pid, name), "product_qty": qty,
                     "product_uom": uom, "price_unit": price, "date_planned": f"{date_planned} 00:00:00"})
             for (pid, name, qty, uom, price) in lines
         ]

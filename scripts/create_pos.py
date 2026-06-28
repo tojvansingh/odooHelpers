@@ -6,9 +6,14 @@ Vendor resolution: every line goes to --vendor, EXCEPT SKUs listed in
 data/vendor_exceptions.csv (sku,vendor) which override. (If --vendor is omitted,
 falls back to each product's primary product.supplierinfo vendor.)
 
+--tab is repeatable: rows from every named tab are merged before grouping, so several
+classes for the same --vendor collapse into a single PO (Odoo POs have one vendor each,
+so differing vendors still split into one PO per vendor). Same SKU on two tabs -> summed.
+
 Run:
-  cd odooHelpers && PYTHONPATH=src uv run python scripts/create_pos.py \
-      --sheet <KEY> --tab "Dish Towels" --vendor "Orchid Overseas" --date-planned 2026-11-15 [--dry-run]
+  cd odooHelpers && PYTHONPATH=src uv run python scripts/create_pos.py --sheet <KEY> \
+      --tab "Dish Towels" --tab "Pillows" --tab "Glassware" \
+      --vendor "Orchid Overseas" --date-planned 2026-11-15 [--dry-run]
 """
 
 from __future__ import annotations
@@ -47,7 +52,8 @@ def resolve_vendor(c: OdooClient, name: str, cache: dict) -> tuple | None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--sheet", required=True)
-    ap.add_argument("--tab", required=True)
+    ap.add_argument("--tab", dest="tabs", action="append", required=True,
+                    help="class tab to read (repeatable; rows from all tabs are merged into the PO(s))")
     ap.add_argument("--vendor", help="default vendor for all lines (else supplierinfo primary)")
     ap.add_argument("--qty-col", default="Order Qty (final)")
     ap.add_argument("--date-planned", default=None)
@@ -62,21 +68,25 @@ def main() -> None:
     if args.prod:
         print(f"*** PRODUCTION write target: {c.s.url} ***")
 
-    ws = GSheets().open_by_key(args.sheet).worksheet(args.tab)
-    vals = ws.get_all_values()
-    hdr = vals[0]
-    qi, di = hdr.index(args.qty_col), hdr.index("Display Name")
-    wanted: dict[str, float] = {}
-    for row in vals[1:]:
-        if not row or len(row) <= max(qi, di):
-            continue
-        try:
-            qty = float(row[qi] or 0)
-        except ValueError:
-            qty = 0
-        m = re.search(r"\[([^\]]+)\]", row[di] or "")
-        if qty > 0 and m:
-            wanted[m.group(1)] = qty
+    sh = GSheets().open_by_key(args.sheet)
+    wanted: dict[str, float] = {}  # SKU -> qty, summed across all tabs (same SKU on 2 tabs -> combined)
+    for tab in args.tabs:
+        vals = sh.worksheet(tab).get_all_values()
+        hdr = vals[0]
+        qi, di = hdr.index(args.qty_col), hdr.index("Display Name")
+        n = 0
+        for row in vals[1:]:
+            if not row or len(row) <= max(qi, di):
+                continue
+            try:
+                qty = float(row[qi] or 0)
+            except ValueError:
+                qty = 0
+            m = re.search(r"\[([^\]]+)\]", row[di] or "")
+            if qty > 0 and m:
+                wanted[m.group(1)] = wanted.get(m.group(1), 0) + qty
+                n += 1
+        print(f"  tab {tab!r}: {n} order rows")
     if not wanted:
         raise SystemExit("No positive Order Qty (final) rows found.")
 

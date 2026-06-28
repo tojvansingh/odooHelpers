@@ -14,6 +14,7 @@ uv run python scripts/odoo/<script>.py [args] [--prod]
 |---|---|---|
 | `scripts/odoo/po_units.py` | Total units on order in a PO — ordered / received / remaining | `uv run python scripts/odoo/po_units.py --po P60165 --prod` |
 | `scripts/odoo/po_set_price.py` | Set the unit price on every line of a PO (`--prod` for production) | `uv run python scripts/odoo/po_set_price.py --po P60261 --price 2.95 --prod` |
+| `scripts/odoo/po_fix_descriptions.py` | Backfill vendor product codes into a PO's line descriptions (for POs made before create_pos.py set them); `--dry-run` to preview | `uv run python scripts/odoo/po_fix_descriptions.py --po P60274 --prod --dry-run` |
 
 ## Workflow tools (in `scripts/`)
 

@@ -70,6 +70,7 @@ def main() -> None:
 
     sh = GSheets().open_by_key(args.sheet)
     wanted: dict[str, float] = {}  # SKU -> qty, summed across all tabs (same SKU on 2 tabs -> combined)
+    src: dict[str, str] = {}       # SKU -> "tab | Display Name", to identify rows (e.g. missing SKUs)
     for tab in args.tabs:
         vals = sh.worksheet(tab).get_all_values()
         hdr = vals[0]
@@ -85,6 +86,7 @@ def main() -> None:
             m = re.search(r"\[([^\]]+)\]", row[di] or "")
             if qty > 0 and m:
                 wanted[m.group(1)] = wanted.get(m.group(1), 0) + qty
+                src[m.group(1)] = f"{tab} | {row[di].strip()}"
                 n += 1
         print(f"  tab {tab!r}: {n} order rows")
     if not wanted:
@@ -150,7 +152,9 @@ def main() -> None:
         name = c.search_read("purchase.order", [["id", "=", po_id]], ["name"])[0]["name"]
         print(f"    -> created DRAFT PO {name} (id {po_id})")
     if missing:
-        print("  missing SKUs:", missing[:10])
+        print(f"  missing SKUs ({len(missing)}) — no active product with this code in Odoo:")
+        for s in missing:
+            print(f"    [{s}]  {src.get(s, '?')}")
     if novendor:
         print("  unresolved:", novendor[:10])
 

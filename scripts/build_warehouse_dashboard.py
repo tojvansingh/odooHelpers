@@ -199,10 +199,15 @@ def build_overview_tab(output, backlog, ships, exc, mo_details, days, today, wd_
 
     # Data quality
     noclass = sorted({m["product"] for m in mo_details if m["klass"] == "(no class)"})
-    if noclass:
+    stale = [m for m in mo_details if m["days_late"] > 30]
+    if noclass or stale:
         g.add()
         g.add(["DATA QUALITY"], kind="section")
-        kv("Unclassified products in open MOs", f"{len(noclass)} (show as '(no class)')")
+        if noclass:
+            kv("Unclassified products in open MOs", f"{len(noclass)} (show as '(no class)')")
+        if stale:
+            kv("MOs scheduled >30 days ago (likely stale)",
+               f"{len(stale)} MOs / {int(round(sum(m['qty'] for m in stale))):,} units — reschedule in Odoo")
 
     g.add()
     for note in (
@@ -544,10 +549,18 @@ def build_production_plan_tab(mo_details, backlog, output, today, wd_elapsed, ca
                f"=IFERROR(ROUND((B{n}+C{n})/E{n},1),0)",
                f"=IFERROR(ROUNDUP(E{n}/{rate_cell[c]},0),\"\")",
                f'=IF(F{n}>5,"🔴 HOTSPOT",IF(F{n}>2,"🟡 Watch","🟢 OK"))'])
-    g.fmt(f"B{hdr+1}:E{len(g.rows)}", INT_FMT)
-    g.fmt(f"F{hdr+1}:F{len(g.rows)}", DEC_FMT)        # work-days to clear (keep the decimal)
-    g.fmt(f"G{hdr+1}:G{len(g.rows)}", INT_FMT)        # people needed
-    g.fmt(f"B{hdr+1}:B{len(g.rows)}", {"backgroundColor": PASTDUE_BG_LIGHT})
+    data_last = len(g.rows)
+    g.fmt(f"B{hdr+1}:E{data_last}", INT_FMT)
+    g.fmt(f"F{hdr+1}:F{data_last}", DEC_FMT)          # work-days to clear (keep the decimal)
+    g.fmt(f"G{hdr+1}:G{data_last}", INT_FMT)          # people needed
+    g.fmt(f"B{hdr+1}:B{data_last}", {"backgroundColor": PASTDUE_BG_LIGHT})
+    # Totals: people needed sums across classes (staffed independently); work-days doesn't sum.
+    tr = g.add(["TOTAL",
+                f"=SUM(B{hdr+1}:B{data_last})", f"=SUM(C{hdr+1}:C{data_last})",
+                f"=SUM(D{hdr+1}:D{data_last})", "", "",
+                f"=SUM(G{hdr+1}:G{data_last})", ""], kind="total")
+    g.fmt(f"B{tr}:D{tr}", INT_FMT)
+    g.fmt(f"G{tr}:G{tr}", INT_FMT)
 
     # 3) Prioritized pick list per class; parts-blocked MOs don't consume capacity.
     g.add()

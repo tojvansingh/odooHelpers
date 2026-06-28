@@ -339,6 +339,7 @@ def fetch_open_exceptions(
     order_rows = []
     for oid, o in orders.items():
         order_rows.append({
+            "id": oid,
             "name": order_name.get(oid, str(oid)),
             "partner": partners.get(oid, ""),
             "scheduled": o["sched"],
@@ -373,10 +374,11 @@ def fetch_open_exceptions(
 def fetch_mo_blocking_map(
     client: OdooClient, tz: ZoneInfo, ptype_ids: list[int], today: dt.date
 ) -> dict[int, dict]:
-    """{mo_id: {'sos': [order names], 'late': bool}} for MOs feeding an open delivery.
+    """{mo_id: {'sos': [(order name, order id)], 'late': bool}} for MOs feeding a delivery.
 
     Built from the reverse of created_production_id on open delivery moves, so an MO
     can be flagged as blocking specific customer orders (and whether any is past due).
+    SO ids are carried so the dashboard can hyperlink each order to Odoo.
     """
     today_utc = utc_str(today, tz)
     dmoves = client.search_read(
@@ -390,17 +392,17 @@ def fetch_mo_blocking_map(
     pick_ids = list({_m2o_id(m["picking_id"]) for m in dmoves})
     picks = {p["id"]: p for p in client.search_read(
         "stock.picking", [["id", "in", pick_ids]], ["sale_id", "scheduled_date"])}
-    out: dict[int, dict] = defaultdict(lambda: {"sos": set(), "late": False})
+    out: dict[int, dict] = defaultdict(lambda: {"sos": {}, "late": False})
     for m in dmoves:
         mo = _m2o_id(m["created_production_id"])
         p = picks.get(_m2o_id(m["picking_id"]))
         if not p:
             continue
         if p.get("sale_id"):
-            out[mo]["sos"].add(_m2o_name(p["sale_id"]))
+            out[mo]["sos"][_m2o_name(p["sale_id"])] = _m2o_id(p["sale_id"])
         if p.get("scheduled_date") and p["scheduled_date"] < today_utc:
             out[mo]["late"] = True
-    return {mo: {"sos": sorted(v["sos"]), "late": v["late"]} for mo, v in out.items()}
+    return {mo: {"sos": sorted(v["sos"].items()), "late": v["late"]} for mo, v in out.items()}
 
 
 def fetch_mo_details(
@@ -423,6 +425,7 @@ def fetch_mo_details(
         start = local_date(r["date_start"], tz) if r.get("date_start") else today
         blk = blocking.get(r["id"], {})
         out.append({
+            "id": r["id"],
             "name": r["name"],
             "product": _m2o_name(r["product_id"]),
             "klass": classes[_m2o_id(r["product_id"])],

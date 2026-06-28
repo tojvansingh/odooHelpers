@@ -38,7 +38,7 @@ from inventorymgr import warehouse_metrics as wm  # noqa: E402
 from inventorymgr.sources.gsheets import GSheets  # noqa: E402
 from inventorymgr.sources.odoo_client import OdooClient  # noqa: E402
 
-DEFAULT_TITLE = "Warehouse Dashboard"
+DEFAULT_TITLE = "Shipping and Manufacturing Dashboard"  # reused by name; renaming in Drive will spawn a fresh copy
 # Channel split by the sale order's "Order Source"; anything not listed is wholesale.
 RETAIL_SOURCES = {"Shopify Retail", "Amazon FBA", "Amazon FBM"}
 
@@ -105,8 +105,26 @@ class TabGrid:
         self.fmts.append((rng, f))
 
 
+ODOO_BASE = ""  # set per-run from the connected Odoo URL, for record hyperlinks
+
+
 def _num(x: float):
     return round(x, 1) if abs(x - round(x)) > 1e-9 else int(round(x))
+
+
+def _link(label: str, model: str, rec_id: int) -> str:
+    """A Google-Sheets HYPERLINK formula opening the Odoo record's form view."""
+    url = f"{ODOO_BASE}/web#id={rec_id}&model={model}&view_type=form"
+    return f'=HYPERLINK("{url}","{str(label).replace(chr(34), chr(34) * 2)}")'
+
+
+def _so_links(name_id_pairs, prefix: str = "") -> str:
+    """Hyperlink a single SO when there's exactly one; else plain comma-joined text
+    (a cell can hold only one HYPERLINK), preserving an optional prefix like '⚠ '."""
+    names = [n for n, _ in name_id_pairs]
+    if len(name_id_pairs) == 1:
+        return _link(prefix + names[0], "sale.order", name_id_pairs[0][1])
+    return prefix + ", ".join(names)
 
 
 def _day_label(d: dt.date) -> str:
@@ -126,11 +144,11 @@ def _backlog_table(g: TabGrid, title: str, backlog) -> None:
         g.pastdue_ranges.append(f"B{hdr + 1}:B{last - 1}")
 
 
-def build_manufacturing_tab(output, backlog, subcon, days, today, month_label, wd_elapsed, tz_name) -> TabGrid:
+def build_manufacturing_tab(output, backlog, days, today, month_label, wd_elapsed, tz_name) -> TabGrid:
     g = TabGrid()
     g.add([f"MANUFACTURING — refreshed {dt.datetime.now():%Y-%m-%d %H:%M}"], kind="title")
     g.add()
-    g.add(["Units finished per class (in-house)"], kind="section")
+    g.add(["Units finished per class"], kind="section")
     hdr = g.add(["Class"] + [_day_label(d) for d in days]
                 + ["This Week", f"Avg/Weekday ({month_label})"], kind="header")
     wk_start, month_start = wm.week_start(today), today.replace(day=1)
@@ -150,19 +168,17 @@ def build_manufacturing_tab(output, backlog, subcon, days, today, month_label, w
     g.fmt(f"G{hdr + 1}:H{last}", {"backgroundColor": SUMMARY_BG})
 
     g.add()
-    _backlog_table(g, "Open MO backlog — units to make in-house, by scheduled start", backlog)
-    g.add()
-    _backlog_table(g, "Subcontracted backlog — units on order with outside vendors", subcon)
+    _backlog_table(g, "Open MO backlog — units to make, by scheduled start", backlog)
 
     g.add()
     for note in (
-        "Units finished = quantity produced on completed (done) in-house MOs, by finish date"
-        f" in {tz_name}. Subcontracted MOs are excluded from this table.",
+        "Covers in-house manufacturing only; subcontracted MOs (made by outside vendors)"
+        " are excluded throughout the dashboard.",
+        f"Units finished = quantity produced on completed (done) MOs, by finish date in {tz_name}.",
         "Backlog = units still to make on open MOs (qty to produce − already produced),"
         " bucketed by the MO's scheduled start date vs today: Past due = start date before"
         " today; Next 2 weeks = within 14 days; 2–4 weeks = 14–28 days; >4 weeks = beyond.",
-        "In-house = MOs run at Petaluma; Subcontracted = MOs fulfilled by outside vendors"
-        " (WH/SBC). See the 'MO Detail' tab for the individual MOs behind each bucket.",
+        "See the 'MO Detail' tab for the individual MOs behind each bucket.",
     ):
         g.add([note], kind="note")
     return g
@@ -247,39 +263,33 @@ def build_mo_detail_tab(mo_details, today, tz_name) -> TabGrid:
     bi = {b: i for i, b in enumerate(wm.DUE_BUCKETS)}
     g.add([f"MO DETAIL — open manufacturing orders by class, refreshed {dt.datetime.now():%Y-%m-%d %H:%M}"],
           kind="title")
-    for sub, label in ((False, "In-house MOs"), (True, "Subcontracted MOs")):
-        items = [m for m in mo_details if m["subcontract"] == sub]
-        g.add()
-        g.add([f"{label} — {len(items)} open MOs, {int(round(sum(m['qty'] for m in items))):,} units"],
-              kind="section")
-        if not items:
-            g.add(["(none)"], kind="note")
-            continue
-        classes = sorted({m["klass"] for m in items},
-                         key=lambda c: -sum(m["qty"] for m in items if m["klass"] == c))
-        for cls in classes:
-            crows = sorted([m for m in items if m["klass"] == cls], key=lambda m: (bi[m["bucket"]], -m["qty"]))
-            units = int(round(sum(m["qty"] for m in crows)))
-            pastdue = int(round(sum(m["qty"] for m in crows if m["days_late"] > 0)))
-            head = f"{cls} — {len(crows)} MOs, {units:,} units" + (f"  ({pastdue:,} past due)" if pastdue else "")
-            g.add([head], kind="subsection")
-            hdr = g.add(MO_DETAIL_COLS, kind="header")
-            for m in crows:
-                blocking = ", ".join(m["blocking_sos"])
-                if m["blocking_sos"] and m["blocking_late"]:
-                    blocking = "⚠ " + blocking
-                g.add([m["name"], m["product"], _num(m["qty"]), m["bucket"],
-                       f"{m['start']:%Y-%m-%d}", m["days_late"] if m["days_late"] > 0 else "",
-                       m["components"], blocking])
-            g.fmt(f"C{hdr + 1}:C{len(g.rows)}", INT_FMT)
-            g.pastdue_ranges.append(f"F{hdr + 1}:F{len(g.rows)}")  # red when days-late > 0
+    g.add()
+    g.add([f"Open MOs — {len(mo_details)} orders, {int(round(sum(m['qty'] for m in mo_details))):,} units to make"],
+          kind="section")
+    classes = sorted({m["klass"] for m in mo_details},
+                     key=lambda c: -sum(m["qty"] for m in mo_details if m["klass"] == c))
+    for cls in classes:
+        crows = sorted([m for m in mo_details if m["klass"] == cls], key=lambda m: (bi[m["bucket"]], -m["qty"]))
+        units = int(round(sum(m["qty"] for m in crows)))
+        pastdue = int(round(sum(m["qty"] for m in crows if m["days_late"] > 0)))
+        head = f"{cls} — {len(crows)} MOs, {units:,} units" + (f"  ({pastdue:,} past due)" if pastdue else "")
+        g.add([head], kind="subsection")
+        hdr = g.add(MO_DETAIL_COLS, kind="header")
+        for m in crows:
+            blocking = _so_links(m["blocking_sos"], "⚠ " if m["blocking_late"] else "") if m["blocking_sos"] else ""
+            g.add([_link(m["name"], "mrp.production", m["id"]), m["product"], _num(m["qty"]), m["bucket"],
+                   f"{m['start']:%Y-%m-%d}", m["days_late"] if m["days_late"] > 0 else "",
+                   m["components"], blocking])
+        g.fmt(f"C{hdr + 1}:C{len(g.rows)}", INT_FMT)
+        g.pastdue_ranges.append(f"F{hdr + 1}:F{len(g.rows)}")  # red when days-late > 0
     g.add()
     for note in (
-        "Grouped by product Class, then bucket within each class (Past due first). Bucket ="
-        " scheduled start vs today; Past-due Days-late cells are highlighted.",
+        "In-house MOs only, grouped by product Class then bucket within each class (Past due"
+        " first). Bucket = scheduled start vs today; Past-due Days-late cells are highlighted.",
         "Components = Odoo's component-availability status for the MO (e.g. Available / Not Available).",
-        "Blocking orders = customer sale orders waiting on this MO (via the make-to-order link);"
-        " ⚠ marks that at least one of those deliveries is already past its scheduled date.",
+        "MO# links to the order in Odoo. Blocking orders = customer SOs waiting on this MO (via the"
+        " make-to-order link); ⚠ marks a blocked delivery already past its scheduled date. (Only a"
+        " lone blocking SO is clickable — a cell can hold just one link.)",
     ):
         g.add([note], kind="note")
     return g
@@ -320,7 +330,7 @@ def build_so_detail_tab(exc, today, tz_name) -> TabGrid:
             for r in crows:
                 items = r[class_field].get(cls, [])
                 waiting = ", ".join(items[:5]) + (" …" if len(items) > 5 else "")
-                g.add([r["name"], r["partner"], _sched(r), _late(r),
+                g.add([_link(r["name"], "sale.order", r["id"]), r["partner"], _sched(r), _late(r),
                        round(r["total"]), round(r["unshipped"]), waiting])
             g.fmt(f"D{hdr + 1}:D{len(g.rows)}", INT_FMT)
             g.fmt(f"E{hdr + 1}:F{len(g.rows)}", USD)
@@ -335,7 +345,8 @@ def build_so_detail_tab(exc, today, tz_name) -> TabGrid:
         cols = ["Order", "Customer", "Scheduled", "Days late", "$ Order Total", "$ Unshipped"]
         hdr = g.add(cols + (["Review reason"] if review else []), kind="header")
         for r in sorted(rows, key=lambda r: -r["days_late"]):
-            base = [r["name"], r["partner"], _sched(r), _late(r), round(r["total"]), round(r["unshipped"])]
+            base = [_link(r["name"], "sale.order", r["id"]), r["partner"], _sched(r), _late(r),
+                    round(r["total"]), round(r["unshipped"])]
             g.add(base + ([", ".join(r["reasons"])] if review else []))
         g.fmt(f"D{hdr + 1}:D{len(g.rows)}", INT_FMT)
         g.fmt(f"E{hdr + 1}:F{len(g.rows)}", USD)
@@ -356,6 +367,7 @@ def build_so_detail_tab(exc, today, tz_name) -> TabGrid:
         " needs review (the delivery is flagged 'to review' — reasons shown in the last column).",
         "Days late = today − the order's earliest open-delivery scheduled date. 'Waiting on' lists that"
         " class's not-yet-available items (first 5). Late-mfg orders also appear under 'Due to ship'.",
+        "Order# links to the sale order in Odoo.",
     ):
         g.add([note], kind="note")
     return g
@@ -442,9 +454,10 @@ def build_production_plan_tab(mo_details, backlog, output, today, wd_elapsed, ca
         first = len(g.rows) + 1
         for m in rows:
             rr = len(g.rows) + 1
-            blocking = ", ".join(m["blocking_sos"][:3]) + (" …" if len(m["blocking_sos"]) > 3 else "")
-            g.add([m["name"], m["product"], _num(m["qty"]), _priority_label(m), m["components"],
-                   blocking, f"=SUM(C{first}:C{rr})", f'=IF(G{rr}<={cap_cell[c]},"✓","")'])
+            blocking = _so_links(m["blocking_sos"][:3]) if m["blocking_sos"] else ""
+            g.add([_link(m["name"], "mrp.production", m["id"]), m["product"], _num(m["qty"]),
+                   _priority_label(m), m["components"], blocking,
+                   f"=SUM(C{first}:C{rr})", f'=IF(G{rr}<={cap_cell[c]},"✓","")'])
         g.fmt(f"C{first}:C{len(g.rows)}", INT_FMT)
         g.fmt(f"G{first}:G{len(g.rows)}", INT_FMT)
         g.fmt(f"H{first}:H{len(g.rows)}", {"horizontalAlignment": "CENTER",
@@ -590,7 +603,9 @@ def main() -> None:
 
 
 def build_dashboard(args) -> None:
+    global ODOO_BASE
     client = OdooClient(profile="prod" if args.prod else "local")
+    ODOO_BASE = client.s.url.rstrip("/")
     tz = ZoneInfo(client.user_tz)
     today = dt.datetime.now(tz).date()
     days = wm.last_weekdays(today, 5)
@@ -602,18 +617,18 @@ def build_dashboard(args) -> None:
     print(f"Odoo: {client.s.url}  tz={tz}  today={today}  picking types={ptype_ids}")
 
     output = wm.fetch_production_output(client, tz, since)
-    backlog, subcon = wm.fetch_production_backlog(client, tz, today)
+    backlog, _subcon = wm.fetch_production_backlog(client, tz, today)  # subcontracted excluded from dashboard
     ships = wm.fetch_shipments(client, tz, ptype_ids, since, RETAIL_SOURCES)
     exc = wm.fetch_open_exceptions(client, tz, ptype_ids, today)
     blocking = wm.fetch_mo_blocking_map(client, tz, ptype_ids, today)
-    mo_details = wm.fetch_mo_details(client, tz, today, blocking)
+    mo_details = [m for m in wm.fetch_mo_details(client, tz, today, blocking) if not m["subcontract"]]
 
     # Open the sheet first so we can preserve the manager's edited capacity values.
     sh = None if args.dry_run else GSheets().open_or_create(args.title)
     cap_overrides = read_capacity_overrides(sh) if sh else {}
 
     grids = {
-        "Manufacturing": build_manufacturing_tab(output, backlog, subcon, days, today, month_label, wd_elapsed, str(tz)),
+        "Manufacturing": build_manufacturing_tab(output, backlog, days, today, month_label, wd_elapsed, str(tz)),
         "MO Detail": build_mo_detail_tab(mo_details, today, str(tz)),
         "Shipping": build_shipping_tab(ships, exc["summary"], days, today, month_label, wd_elapsed, str(tz)),
         "SO Detail": build_so_detail_tab(exc, today, str(tz)),

@@ -12,10 +12,11 @@ Tabs:
                     deliveries: due-but-waiting-on-manufacturing, late and its split
                     (waiting on manufacturing / waiting on inventory / ready).
   SO Detail       — the individual open customer orders behind each Shipping bucket.
-  Production Plan — editable per-class daily capacity, a hotspot view (work-days to
-                    clear at that capacity), and a prioritized list of MOs to make
-                    tomorrow with a ✓ cut-line that fits within capacity. Capacity
-                    edits are preserved across refreshes.
+  Production Plan — editable per-class daily capacity + staffing rate, a hotspot view
+                    (work-days to clear and people needed at that capacity), and a
+                    prioritized list of MOs to make tomorrow with a ✓ cut-line within
+                    capacity (parts-short MOs marked ⛔ and excluded) plus per-class
+                    planned/deferred subtotals. Capacity & rate edits persist.
 """
 
 from __future__ import annotations
@@ -374,8 +375,9 @@ def build_so_detail_tab(exc, today, tz_name) -> TabGrid:
 
 
 PLAN_TAB = "Production Plan"
-PLAN_COLS = ["MO", "Product", "Qty", "Priority", "Components", "Blocking orders", "Cum. units", "Make tmrw?"]
-PLAN_WIDTHS = [115, 250, 70, 110, 115, 200, 90, 95]
+PLAN_COLS = ["MO", "Product", "Qty", "Priority", "Components", "Blocking orders",
+             "Plan qty", "Cum plannable", "Make tmrw?"]
+PLAN_WIDTHS = [115, 235, 65, 105, 110, 175, 75, 100, 95]
 
 
 def _priority(m: dict) -> tuple:
@@ -395,113 +397,138 @@ def _priority_label(m: dict) -> str:
     return "Stock build"
 
 
+def _mo_ready(m: dict) -> bool:
+    """An MO can run tomorrow only if its components aren't short. Odoo marks this
+    'Not Available' / 'Partially Available'; blank or 'Available' means good to go."""
+    comp = (m.get("components") or "").lower()
+    return comp not in ("not available",) and not comp.startswith("partial")
+
+
 def build_production_plan_tab(mo_details, backlog, output, today, wd_elapsed, cap_overrides) -> TabGrid:
     g = TabGrid()
     g.col_widths = PLAN_WIDTHS
-    month_start = today.replace(day=1)
     inhouse = [m for m in mo_details if not m["subcontract"]]
     classes = sorted({m["klass"] for m in inhouse},
                      key=lambda c: -sum(m["qty"] for m in inhouse if m["klass"] == c))
 
-    def seed(c):
+    def seed_cap(c):
         # Manager's saved edit wins; else a placeholder = best single-day output observed
         # (demonstrated capability beats the average, which low recent volume drags down).
-        if c in cap_overrides:
-            return cap_overrides[c]
-        peak = max(output.get(c, {}).values(), default=0)
-        return max(int(round(peak)), 1)
+        saved = cap_overrides.get(c, {}).get("cap")
+        if saved is not None:
+            return saved
+        return max(int(round(max(output.get(c, {}).values(), default=0))), 1)
+
+    def seed_rate(c):
+        saved = cap_overrides.get(c, {}).get("rate")
+        return saved if saved is not None else ""  # blank until the manager sets it
 
     g.add([f"PRODUCTION PLAN — what to make tomorrow, refreshed {dt.datetime.now():%Y-%m-%d %H:%M}"], kind="title")
 
-    # 1) Editable daily capacity (preserved across refreshes).
+    # 1) Editable daily capacity + staffing rate (both preserved across refreshes).
     g.add()
-    g.add(["Daily capacity — units/day per class  (EDIT these; tweaks are kept on refresh)"], kind="section")
-    g.add(["Class", "Units/Day"], kind="header")
-    cap_cell = {}
+    g.add(["Daily capacity & staffing — EDIT the yellow cells; tweaks are kept on refresh"], kind="section")
+    g.add(["Class", "Units/Day", "Units/person-day"], kind="header")
+    cap_cell, rate_cell = {}, {}
     cap_first = len(g.rows) + 1
     for c in classes:
-        r = g.add([c, seed(c)])
+        r = g.add([c, seed_cap(c), seed_rate(c)])
         cap_cell[c] = f"$B${r}"
+        rate_cell[c] = f"$C${r}"
     if classes:
-        g.fmt(f"B{cap_first}:B{len(g.rows)}", {"backgroundColor": EDIT_BG, **INT_FMT})
+        g.fmt(f"B{cap_first}:C{len(g.rows)}", {"backgroundColor": EDIT_BG, **INT_FMT})
 
-    # 2) Hotspots: live work-days-to-clear from the editable capacity above.
+    # 2) Hotspots: live work-days-to-clear and people needed, from the editable cells above.
     g.add()
-    g.add(["Class load & hotspots — work-days to clear the actionable backlog at the capacity above"],
+    g.add(["Class load & hotspots — work-days to clear the actionable backlog at the set capacity"],
           kind="section")
     hdr = g.add(["Class", "Past-due", "Due ≤2 wks", "On late orders", "Capacity/day",
-                 "Work-days to clear", "Status"], kind="header")
+                 "Work-days to clear", "People needed", "Status"], kind="header")
     for c in classes:
         past = int(round(backlog.get(c, {}).get(wm.DUE_BUCKETS[0], 0)))
         soon = int(round(backlog.get(c, {}).get(wm.DUE_BUCKETS[1], 0)))
         on_late = int(round(sum(m["qty"] for m in inhouse if m["klass"] == c and m["blocking_late"])))
-        r = g.add([c, past, soon, on_late, f"={cap_cell[c]}",
-                   f"=IFERROR(ROUND((B{len(g.rows)+1}+C{len(g.rows)+1})/E{len(g.rows)+1},1),0)",
-                   f'=IF(F{len(g.rows)+1}>5,"🔴 HOTSPOT",IF(F{len(g.rows)+1}>2,"🟡 Watch","🟢 OK"))'])
+        n = len(g.rows) + 1
+        g.add([c, past, soon, on_late, f"={cap_cell[c]}",
+               f"=IFERROR(ROUND((B{n}+C{n})/E{n},1),0)",
+               f"=IFERROR(ROUNDUP(E{n}/{rate_cell[c]},0),\"\")",
+               f'=IF(F{n}>5,"🔴 HOTSPOT",IF(F{n}>2,"🟡 Watch","🟢 OK"))'])
     g.fmt(f"B{hdr+1}:E{len(g.rows)}", INT_FMT)
+    g.fmt(f"F{hdr+1}:F{len(g.rows)}", DEC_FMT)        # work-days to clear (keep the decimal)
+    g.fmt(f"G{hdr+1}:G{len(g.rows)}", INT_FMT)        # people needed
     g.fmt(f"B{hdr+1}:B{len(g.rows)}", {"backgroundColor": PASTDUE_BG_LIGHT})
 
-    # 3) Prioritized pick list per class; ✓ marks MOs that fit within the day's capacity.
+    # 3) Prioritized pick list per class; parts-blocked MOs don't consume capacity.
     g.add()
-    g.add(["Tomorrow's suggested MOs — prioritized; ✓ = fits within that class's daily capacity"],
+    g.add(["Tomorrow's suggested MOs — prioritized; ✓ = fits within capacity, ⛔ = waiting on parts"],
           kind="section")
     for c in classes:
         rows = sorted([m for m in inhouse if m["klass"] == c], key=_priority)
         pending = int(round(sum(m["qty"] for m in rows)))
-        g.add([f"{c} — {len(rows)} MOs, {pending:,} units pending  (capacity {cap_cell[c].replace('$','')})"],
+        g.add([f"{c} — {len(rows)} MOs, {pending:,} units pending  (capacity {cap_cell[c].replace('$', '')})"],
               kind="subsection")
         hdr = g.add(PLAN_COLS, kind="header")
         first = len(g.rows) + 1
         for m in rows:
             rr = len(g.rows) + 1
             blocking = _so_links(m["blocking_sos"][:3]) if m["blocking_sos"] else ""
+            plan_qty = _num(m["qty"]) if _mo_ready(m) else 0
             g.add([_link(m["name"], "mrp.production", m["id"]), m["product"], _num(m["qty"]),
-                   _priority_label(m), m["components"], blocking,
-                   f"=SUM(C{first}:C{rr})", f'=IF(G{rr}<={cap_cell[c]},"✓","")'])
-        g.fmt(f"C{first}:C{len(g.rows)}", INT_FMT)
-        g.fmt(f"G{first}:G{len(g.rows)}", INT_FMT)
-        g.fmt(f"H{first}:H{len(g.rows)}", {"horizontalAlignment": "CENTER",
-                                           "textFormat": {"bold": True, "foregroundColor": GREEN_TEXT}})
+                   _priority_label(m), m["components"], blocking, plan_qty,
+                   f"=SUM(G{first}:G{rr})",
+                   f'=IF(G{rr}=0,"⛔ parts",IF(H{rr}<={cap_cell[c]},"✓",""))'])
+        last = len(g.rows)
+        g.add([f'=CONCATENATE("▸ Tomorrow — planned ",SUMIF(I{first}:I{last},"✓",C{first}:C{last}),'
+               f'" units · parts-blocked ",SUMIF(I{first}:I{last},"⛔ parts",C{first}:C{last}),'
+               f'" units · deferred ",{pending}-SUMIF(I{first}:I{last},"✓",C{first}:C{last})'
+               f'-SUMIF(I{first}:I{last},"⛔ parts",C{first}:C{last})," units")'], kind="total")
+        g.fmt(f"C{first}:C{last}", INT_FMT)
+        g.fmt(f"G{first}:H{last}", INT_FMT)
+        g.fmt(f"I{first}:I{last}", {"horizontalAlignment": "CENTER",
+                                    "textFormat": {"bold": True, "foregroundColor": GREEN_TEXT}})
 
     g.add()
     for note in (
-        "Capacity cells are yours to edit — the hotspot work-days and the ✓ cut-line below recompute live,"
-        " and your edits are read back and kept each nightly refresh.",
+        "Edit the yellow Units/Day and Units/person-day cells — hotspot work-days, People needed,"
+        " and the ✓ cut-line all recompute live, and your edits are kept on each nightly refresh.",
         "Priority order: ⚠ Late order (MO blocks a past-due customer delivery) → Customer order (blocks an"
         " open order) → Past due (scheduled start passed) → Stock build. Within a tier, most-overdue first.",
-        "✓ = this MO fits within the class's daily capacity (cumulative units ≤ capacity). Work-days to clear"
-        " = (past-due + due-within-2-weeks units) ÷ capacity/day; 🔴 >5 days, 🟡 >2 days.",
-        "Subcontracted MOs are excluded (made by outside vendors). Components = Odoo readiness; 'Not Available'"
-        " MOs need parts before they can run.",
+        "✓ = fits within the class's daily capacity. ⛔ parts = components short ('Not Available' /"
+        " 'Partially Available'), so it can't run tomorrow and doesn't consume capacity — expedite parts.",
+        "Work-days to clear = (past-due + due-within-2-weeks units) ÷ capacity/day; 🔴 >5, 🟡 >2. People"
+        " needed = capacity/day ÷ units-per-person-day (blank until you set the rate). Subcontracted MOs excluded.",
     ):
         g.add([note], kind="note")
     return g
 
 
-def read_capacity_overrides(sh) -> dict[str, float]:
-    """Read the manager's edited Units/Day values from the existing Production Plan tab,
-    so a refresh preserves them instead of resetting to the seeded defaults."""
+def read_capacity_overrides(sh) -> dict[str, dict]:
+    """Read the manager's edited Units/Day and Units/person-day values from the existing
+    Production Plan tab, so a refresh preserves them. Returns {class: {'cap', 'rate'}}."""
     try:
         ws = sh.worksheet(PLAN_TAB)
     except gspread.WorksheetNotFound:
         return {}
-    vals = ws.get_all_values()
-    out: dict[str, float] = {}
+    out: dict[str, dict] = {}
     in_cap = False
-    for row in vals:
+    for row in ws.get_all_values():
         head = (row[0] if row else "").strip()
         if head.startswith("Daily capacity"):
             in_cap = True
             continue
         if in_cap:
-            if head in ("", "Class"):
-                if head == "":  # blank row ends the capacity table
-                    break
+            if head == "":  # blank row ends the capacity table
+                break
+            if head == "Class":
                 continue
-            try:
-                out[head] = float(str(row[1]).replace(",", ""))
-            except (IndexError, ValueError):
-                pass
+            saved = {}
+            for key, col in (("cap", 1), ("rate", 2)):
+                try:
+                    saved[key] = float(str(row[col]).replace(",", ""))
+                except (IndexError, ValueError):
+                    pass
+            if saved:
+                out[head] = saved
     return out
 
 

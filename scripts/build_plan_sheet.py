@@ -36,10 +36,35 @@ def months_between(a: datetime.date, b: datetime.date) -> int:
     return (b.year - a.year) * 12 + (b.month - a.month)
 
 
+def parse_class_spec(spec: str, default_collection: str | None) -> tuple[str, str]:
+    """'Pillows:Geography' -> ('Pillows','Geography'); 'Pillows:<>Geography' -> ('Pillows','<>Geography');
+    'Pillows' -> ('Pillows', default_collection)."""
+    if ":" in spec:
+        cls, coll = spec.split(":", 1)
+        return cls.strip(), coll.strip()
+    return spec.strip(), (default_collection or "").strip()
+
+
+def collection_matches(product_collection: str, coll: str) -> bool:
+    pc = (product_collection or "").strip().lower()
+    if coll.startswith("<>"):
+        return pc != coll[2:].strip().lower()
+    return pc == coll.strip().lower()
+
+
+def class_label(cls: str, coll: str) -> str:
+    if coll.startswith("<>"):
+        return f"{cls} (not {coll[2:].strip()})"
+    return f"{cls} ({coll})" if coll else cls
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--class", dest="classes", action="append", help="Class name (repeatable)")
-    ap.add_argument("--collection", help="filter products to this collection")
+    ap.add_argument("--class", dest="classes", action="append",
+                    help="Class name, optionally with a per-class collection as 'Class:Collection' "
+                         "(e.g. 'Pillows:Geography' or 'Pillows:<>Geography' to exclude); repeatable")
+    ap.add_argument("--collection", help="default collection filter for classes lacking their own "
+                                         "(prefix <> to exclude, e.g. '<>Geography')")
     ap.add_argument("--vendor", help="filter products to those supplied by this vendor")
     ap.add_argument("--arrive", help="override order arrival date YYYY-MM-DD (sizes horizon = months-to-arrival + 6)")
     ap.add_argument("--title", help="spreadsheet title (reused/overwritten)")
@@ -55,20 +80,20 @@ def main() -> None:
         horizon_override = months_between(today, datetime.date.fromisoformat(args.arrive)) + 6
 
     blocks: dict = {}
-    for cls in classes:
-        params = resolve_class_params(params_all, cls, args.collection)
+    for spec in classes:
+        cls, coll = parse_class_spec(spec, args.collection)
+        params = resolve_class_params(params_all, cls, "" if coll.startswith("<>") else coll)
         if params is None:
             raise SystemExit(f"No params for class {cls!r} in data/class_params.csv")
         products = read_products_by_class(client, cls)
-        if args.collection:
-            products = {pid: p for pid, p in products.items()
-                        if (p.collection or "").strip().lower() == args.collection.strip().lower()}
+        if coll:
+            products = {pid: p for pid, p in products.items() if collection_matches(p.collection, coll)}
         if args.vendor:
             keep = read_product_ids_for_vendor(client, args.vendor)
             products = {pid: p for pid, p in products.items() if pid in keep}
         pids = list(products)
         if not pids:
-            raise SystemExit(f"No products for {cls} (collection={args.collection}, vendor={args.vendor})")
+            raise SystemExit(f"No products for {cls} (collection={coll!r}, vendor={args.vendor})")
 
         sales = read_monthly_sales(client, pids)
         # Incoming = Ready receipts only (stock.move state=assigned, incoming), dated by the
@@ -93,10 +118,11 @@ def main() -> None:
             products, sales, remaining, params, today.year, today.month,
             bookings=bookings_by_pid, buyers_by_month=buyers, horizon_override=horizon_override,
         )
-        blocks[cls] = (months, results, params.moq_step)
-        print(f"{cls}: {len(products)} products, {n}-mo horizon")
+        label = class_label(cls, coll)
+        blocks[label] = (months, results, params.moq_step)
+        print(f"{label}: {len(products)} products, {n}-mo horizon")
 
-    title = args.title or "Inventory Plan — " + "+".join(classes) + (f" ({args.collection})" if args.collection else "")
+    title = args.title or "Inventory Plan — " + " + ".join(blocks)
     sh = build_review_spreadsheet(GSheets(), blocks, title)
     print("\nSheet:", title)
     print("URL:", sh.url)

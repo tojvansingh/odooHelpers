@@ -45,26 +45,38 @@ def parse_class_spec(spec: str, default_collection: str | None) -> tuple[str, st
     return spec.strip(), (default_collection or "").strip()
 
 
-def collection_matches(product_collection: str, coll: str) -> bool:
-    pc = (product_collection or "").strip().lower()
-    if coll.startswith("<>"):
-        return pc != coll[2:].strip().lower()
-    return pc == coll.strip().lower()
+def parse_collection(coll: str) -> tuple[bool, list[str]]:
+    """'Geography,Astrology' -> (False, ['Geography','Astrology']);
+    '<>Geography,Astrology' -> (True, ['Geography','Astrology']) (exclude all of them)."""
+    coll = (coll or "").strip()
+    negate = coll.startswith("<>")
+    if negate:
+        coll = coll[2:]
+    return negate, [c.strip() for c in coll.split(",") if c.strip()]
 
 
-def class_label(cls: str, coll: str) -> str:
-    if coll.startswith("<>"):
-        return f"{cls} (not {coll[2:].strip()})"
-    return f"{cls} ({coll})" if coll else cls
+def collection_matches(product_collection: str, negate: bool, names: list[str]) -> bool:
+    if not names:
+        return True
+    hit = (product_collection or "").strip().lower() in {n.lower() for n in names}
+    return (not hit) if negate else hit
+
+
+def class_label(cls: str, negate: bool, names: list[str]) -> str:
+    if not names:
+        return cls
+    joined = ", ".join(names)
+    return f"{cls} (not {joined})" if negate else f"{cls} ({joined})"
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--class", dest="classes", action="append",
-                    help="Class name, optionally with a per-class collection as 'Class:Collection' "
-                         "(e.g. 'Pillows:Geography' or 'Pillows:<>Geography' to exclude); repeatable")
+                    help="Class name, optionally with a per-class collection as 'Class:Collection'. "
+                         "Collection may be a comma-separated list ('Pillows:Geography,Astrology') and/or "
+                         "negated with a leading <> ('Pillows:<>Geography,Astrology' excludes both); repeatable")
     ap.add_argument("--collection", help="default collection filter for classes lacking their own "
-                                         "(prefix <> to exclude, e.g. '<>Geography')")
+                                         "(comma-separated list; prefix <> to exclude, e.g. '<>Geography,Astrology')")
     ap.add_argument("--vendor", help="filter products to those supplied by this vendor")
     ap.add_argument("--arrive", help="override order arrival date YYYY-MM-DD (sizes horizon = months-to-arrival + 6)")
     ap.add_argument("--title", help="spreadsheet title (reused/overwritten)")
@@ -82,12 +94,16 @@ def main() -> None:
     blocks: dict = {}
     for spec in classes:
         cls, coll = parse_class_spec(spec, args.collection)
-        params = resolve_class_params(params_all, cls, "" if coll.startswith("<>") else coll)
+        negate, coll_names = parse_collection(coll)
+        # one positive collection -> its param override; else (multiple or negated) class default
+        params_coll = coll_names[0] if (not negate and len(coll_names) == 1) else ""
+        params = resolve_class_params(params_all, cls, params_coll)
         if params is None:
             raise SystemExit(f"No params for class {cls!r} in data/class_params.csv")
         products = read_products_by_class(client, cls)
-        if coll:
-            products = {pid: p for pid, p in products.items() if collection_matches(p.collection, coll)}
+        if coll_names:
+            products = {pid: p for pid, p in products.items()
+                        if collection_matches(p.collection, negate, coll_names)}
         if args.vendor:
             keep = read_product_ids_for_vendor(client, args.vendor)
             products = {pid: p for pid, p in products.items() if pid in keep}
@@ -118,7 +134,7 @@ def main() -> None:
             products, sales, remaining, params, today.year, today.month,
             bookings=bookings_by_pid, buyers_by_month=buyers, horizon_override=horizon_override,
         )
-        label = class_label(cls, coll)
+        label = class_label(cls, negate, coll_names)
         blocks[label] = (months, results, params.moq_step)
         print(f"{label}: {len(products)} products, {n}-mo horizon")
 

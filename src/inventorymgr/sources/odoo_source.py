@@ -38,7 +38,8 @@ def _to_product(r: dict) -> Product:
 
 def read_products_by_class(client: OdooClient, class_name: str, active_only: bool = True) -> dict[int, Product]:
     # Goods only (type='consu' is "Goods" in Odoo 18); excludes services/combos.
-    domain = [["class_id.name", "=", class_name], ["type", "=", "consu"]]
+    # purchase_ok=True: only products that can be purchased (planning produces POs).
+    domain = [["class_id.name", "=", class_name], ["type", "=", "consu"], ["purchase_ok", "=", True]]
     if active_only:
         domain.append(["active", "=", True])
     recs = client.search_read("product.product", domain, STOCK_FIELDS)

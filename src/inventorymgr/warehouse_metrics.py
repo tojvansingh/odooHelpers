@@ -371,6 +371,19 @@ def fetch_open_exceptions(
     return {"summary": summary, "orders": order_rows}
 
 
+LATE_AGE_BUCKETS = (("1–7 days", 1, 7), ("8–30 days", 8, 30), (">30 days", 31, None))
+
+
+def late_aging(orders: list[dict]) -> list[tuple[str, int, float]]:
+    """[(age label, # late orders, $ order total)] bucketed by how overdue each is."""
+    late = [r for r in orders if r.get("late")]
+    out = []
+    for label, lo, hi in LATE_AGE_BUCKETS:
+        sel = [r for r in late if r["days_late"] >= lo and (hi is None or r["days_late"] <= hi)]
+        out.append((label, len(sel), sum(r["total"] for r in sel)))
+    return out
+
+
 def fetch_mo_blocking_map(
     client: OdooClient, tz: ZoneInfo, ptype_ids: list[int], today: dt.date
 ) -> dict[int, dict]:

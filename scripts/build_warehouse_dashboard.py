@@ -3,6 +3,8 @@
 Run: cd odooHelpers && uv run python scripts/build_warehouse_dashboard.py [--prod] [--dry-run]
 
 Tabs:
+  Overview        — one-glance KPIs across manufacturing and shipping (this week,
+                    monthly averages, backlog, late orders, quick wins, data gaps).
   Manufacturing   — units finished per class (last 5 weekdays, this week, avg/weekday
                     this month) and open-MO backlog bucketed by scheduled start,
                     split in-house vs subcontracted.
@@ -79,6 +81,7 @@ INT_FMT = {"numberFormat": {"type": "NUMBER", "pattern": "#,##0"}}
 DEC_FMT = {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.0"}}
 USD = {"numberFormat": {"type": "CURRENCY", "pattern": "$#,##0"}}
 TAB_COLORS = {
+    "Overview": {"red": 0.25, "green": 0.27, "blue": 0.32},
     "Manufacturing": {"red": 0.31, "green": 0.51, "blue": 0.74},
     "MO Detail": {"red": 0.60, "green": 0.73, "blue": 0.88},
     "Shipping": {"red": 0.42, "green": 0.66, "blue": 0.31},
@@ -130,6 +133,85 @@ def _so_links(name_id_pairs, prefix: str = "") -> str:
 
 def _day_label(d: dt.date) -> str:
     return f"{d:%a} {d.month}/{d.day}"
+
+
+def _money(x) -> str:
+    return f"${round(x):,}"
+
+
+def build_overview_tab(output, backlog, ships, exc, mo_details, days, today, wd_elapsed, tz_name) -> TabGrid:
+    g = TabGrid()
+    g.col_widths = [340, 300]
+    wk_start, month_start = wm.week_start(today), today.replace(day=1)
+    s = exc["summary"]
+    g.add([f"OVERVIEW — at a glance, refreshed {dt.datetime.now():%Y-%m-%d %H:%M}"], kind="title")
+
+    def kv(label, value):
+        g.add([label, value])
+
+    # Manufacturing
+    fin_week = sum(q for c in output for d, q in output[c].items() if d >= wk_start)
+    fin_month = sum(q for c in output for d, q in output[c].items() if d >= month_start)
+    backlog_total = sum(v for c in backlog for v in backlog[c].values())
+    backlog_past = sum(backlog[c].get(wm.DUE_BUCKETS[0], 0) for c in backlog)
+    blocked = [m for m in mo_details if not _mo_ready(m)]
+    top_past = sorted(((c, backlog[c].get(wm.DUE_BUCKETS[0], 0)) for c in backlog),
+                      key=lambda kv: -kv[1])
+    top_past = [f"{c} {int(round(u)):,}" for c, u in top_past if u > 0][:3]
+    g.add()
+    g.add(["MANUFACTURING (in-house)"], kind="section")
+    kv("Units finished this week", int(round(fin_week)))
+    kv("Avg finished / weekday this month", round(fin_month / wd_elapsed, 1))
+    kv("Open backlog (units)", int(round(backlog_total)))
+    kv("Backlog past due (units)", int(round(backlog_past)))
+    kv("MOs blocked on parts", f"{len(blocked)} MOs / {int(round(sum(m['qty'] for m in blocked))):,} units")
+    kv("Biggest past-due classes", ", ".join(top_past) or "none")
+
+    # Shipping
+    def ship_week(chan):
+        ids, val = set(), 0.0
+        for d, (i, v) in ships[chan].items():
+            if d >= wk_start:
+                ids |= i
+                val += v
+        return len(ids), val
+
+    def ship_month_val(chan):
+        return sum(v for d, (_, v) in ships[chan].items() if d >= month_start)
+
+    r_n, r_v = ship_week("Retail")
+    w_n, w_v = ship_week("Wholesale")
+    month_val = ship_month_val("Retail") + ship_month_val("Wholesale")
+    g.add()
+    g.add(["SHIPPING (Petaluma + Massachusetts)"], kind="section")
+    kv("Shipped this week — retail", f"{r_n} orders / {_money(r_v)}")
+    kv("Shipped this week — wholesale", f"{w_n} orders / {_money(w_v)}")
+    kv("Avg shipped / weekday this month", _money(month_val / wd_elapsed))
+    g.add()
+    g.add(["OPEN ORDER EXCEPTIONS"], kind="section")
+    kv("Late orders", f"{s['late']['orders']} / {_money(s['late']['total'])}")
+    kv("  blocked by manufacturing", f"{s['late_mfg']['orders']} / {_money(s['late_mfg']['unshipped'])} unshipped")
+    kv("  waiting on inventory", f"{s['late_inv']['orders']} / {_money(s['late_inv']['unshipped'])} unshipped")
+    kv("  ready to ship now (no review)", f"{s['late_ready_clean']['orders']} / {_money(s['late_ready_clean']['total'])}")
+    kv("  ready but needs review", f"{s['late_ready_review']['orders']} / {_money(s['late_ready_review']['total'])}")
+    aging = wm.late_aging(exc["orders"])
+    kv("Late by age (1–7 / 8–30 / >30 days)", " · ".join(f"{n}" for _, n, _ in aging) + " orders")
+
+    # Data quality
+    noclass = sorted({m["product"] for m in mo_details if m["klass"] == "(no class)"})
+    if noclass:
+        g.add()
+        g.add(["DATA QUALITY"], kind="section")
+        kv("Unclassified products in open MOs", f"{len(noclass)} (show as '(no class)')")
+
+    g.add()
+    for note in (
+        "One-glance summary; open the per-area tabs for detail. 'This week' = since Monday;"
+        f" monthly averages divide by weekdays elapsed. Times/dates in {tz_name}.",
+        "Quick wins = 'ready to ship now (no review)': stock is on hand and nothing is holding them.",
+    ):
+        g.add([note], kind="note")
+    return g
 
 
 def _backlog_table(g: TabGrid, title: str, backlog) -> None:
@@ -185,7 +267,8 @@ def build_manufacturing_tab(output, backlog, days, today, month_label, wd_elapse
     return g
 
 
-def build_shipping_tab(ships, summary, days, today, month_label, wd_elapsed, tz_name) -> TabGrid:
+def build_shipping_tab(ships, exc, days, today, month_label, wd_elapsed, tz_name) -> TabGrid:
+    summary = exc["summary"]
     g = TabGrid()
     g.add([f"SHIPPING — refreshed {dt.datetime.now():%Y-%m-%d %H:%M}"], kind="title")
     g.add()
@@ -234,6 +317,14 @@ def build_shipping_tab(ships, summary, days, today, month_label, wd_elapsed, tz_
         r = g.add([label, e["orders"], round(e["total"]), round(e["unshipped"])], kind=kind)
         g.fmt(f"B{r}:B{r}", INT_FMT)
         g.fmt(f"C{r}:D{r}", USD)
+
+    g.add()
+    g.add(["Late orders by age (how far past the scheduled ship date)"], kind="section")
+    hdr = g.add(["Age", "# Orders", "$ Order Total"], kind="header")
+    for label, n, total in wm.late_aging(exc["orders"]):
+        g.add([label, n, round(total)])
+    g.fmt(f"B{hdr + 1}:B{len(g.rows)}", INT_FMT)
+    g.fmt(f"C{hdr + 1}:C{len(g.rows)}", USD)
 
     g.add()
     for note in (
@@ -655,9 +746,10 @@ def build_dashboard(args) -> None:
     cap_overrides = read_capacity_overrides(sh) if sh else {}
 
     grids = {
+        "Overview": build_overview_tab(output, backlog, ships, exc, mo_details, days, today, wd_elapsed, str(tz)),
         "Manufacturing": build_manufacturing_tab(output, backlog, days, today, month_label, wd_elapsed, str(tz)),
         "MO Detail": build_mo_detail_tab(mo_details, today, str(tz)),
-        "Shipping": build_shipping_tab(ships, exc["summary"], days, today, month_label, wd_elapsed, str(tz)),
+        "Shipping": build_shipping_tab(ships, exc, days, today, month_label, wd_elapsed, str(tz)),
         "SO Detail": build_so_detail_tab(exc, today, str(tz)),
         "Production Plan": build_production_plan_tab(mo_details, backlog, output, today, wd_elapsed, cap_overrides),
     }

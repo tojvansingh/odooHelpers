@@ -81,3 +81,16 @@ def test_is_due_morning_no_run_if_already_current():
     # Ran yesterday evening at 16:35; now this morning, before today's boundary → not owed yet
     now = dt.datetime(2026, 6, 10, 9, 0)
     assert wm.is_due(dt.datetime(2026, 6, 9, 16, 35), now, 16, 30) is False
+
+
+def test_late_aging_buckets():
+    orders = [
+        {"late": True, "days_late": 1, "total": 100.0},    # 1-7
+        {"late": True, "days_late": 7, "total": 50.0},     # 1-7
+        {"late": True, "days_late": 8, "total": 200.0},    # 8-30
+        {"late": True, "days_late": 30, "total": 25.0},    # 8-30
+        {"late": True, "days_late": 31, "total": 400.0},   # >30
+        {"late": False, "days_late": 0, "total": 999.0},   # not late → excluded
+    ]
+    result = wm.late_aging(orders)
+    assert result == [("1–7 days", 2, 150.0), ("8–30 days", 2, 225.0), (">30 days", 1, 400.0)]
